@@ -1,0 +1,931 @@
+5.2 A Na√Øve Implementation of Distributed Data Parallel Training
+
+Now that we‚Äôve seen the basics of writing distributed applications in PyTorch, let‚Äôs build a minimal
+implementation of distributed data parallel (DDP) training.
+Data parallelism splits batches across multiple devices (e.g., GPUs), enabling training on large batch sizes
+that do not fit on a single device. For example, given four devices that can each handle a maximum batch
+size of 32, data parallel training would enable an effective batch size of 128.
+Here are the steps for na√Øvely doing distributed data parallel training. Initially, each device constructs a
+(randomly-initialized) model. We use the broadcast collective communication operation to send the model
+parameters from rank 0 to all other ranks. At the start of training, each device holds an identical copy of
+the model parameters and optimizer states (e.g. the accumulated gradient statistics in Adam).
+1. Given a batch with Ì†µÌ±õ examples, the batch is sharded and each device receives Ì†µÌ±õ/Ì†µÌ±ë disjoint examples
+
+   (where Ì†µÌ±ë is the number of devices used for data parallel training). Ì†µÌ±ë should divide Ì†µÌ±õ, otherwise some
+   ranks would do more work than others, and the step is bottlenecked by the slowest.
+2. Each device uses its local copy of the model parameters to run a forward pass on its Ì†µÌ±õ/Ì†µÌ±ë examples and
+   a backward pass to calculate the gradients. Note that at this point, each device holds the gradients
+   computed from the Ì†µÌ±õ/Ì†µÌ±ë examples it received.
+3. We then use the all-reduce collective communication operation to average the gradients across the
+   different devices, so each device holds the gradients averaged across all Ì†µÌ±õ examples.
+4. Next, each device runs an optimizer step to update its copy of the parameters‚Äîfrom the optimizer‚Äôs
+   perspective, it is simply optimizing a local model. The parameters and optimizer states will stay in
+   sync on all of the different devices since they all start from the same initial model and optimizer state
+   and use the same averaged gradients for each iteration. At this point, we‚Äôve completed a single training
+   iteration and can repeat the process.
+
+  Problem (naive_ddp): Na√Øve DDP (5 points)
+
+     Deliverable: Implement a na√Øve form of distributed data parallel training that all-reduces
+     individual parameter gradients after the backward pass. To test your implementation, implement
+     [adapters.get_ddp] and (optionally) [adapters.ddp_on_after_backward] , then run uv run pytest
+     tests/test_ddp.py.
+
+  Problem (naive_ddp_benchmarking): Na√Øve DDP Benchmarking (3 points)
+
+     In this na√Øve DDP implementation, parameter gradients are individually all-reduced across ranks
+     after each backward pass. To better understand the overhead of data parallel training, create a
+     script to benchmark your previously-implemented language model when trained with this na√Øve
+     implementation of DDP. Measure the total time per training step and the proportion of time
+     spent on communicating gradients. Collect measurements in the single-node setting (1 node x 2
+     GPUs) for the xl model size described in Section 2.1.2.
+     Deliverable: A description of your benchmarking setup, along with the measured time per
+     training iteration and time spent communicating gradients for each setting.
+
+                                                                     33
+5.3 Improving Upon the Minimal DDP Implementation
+
+The minimal DDP implementation that we saw in Section 5.2 has a couple of key limitations:
+
+1. It conducts a separate all-reduce operation for every parameter tensor. Each communication call incurs
+   overhead, so it may be advantageous to batch communication calls to minimize this overhead.
+
+2. It waits for the backward pass to finish before communicating gradients. However, the backward pass
+   is incrementally computed. Thus, when a parameter gradient is ready, it can immediately be
+   communicated without waiting for the gradients of the other parameters. This allows us to overlap
+   communication of gradients with computation of the backward pass, reducing the overhead of
+   distributed data parallel training.
+
+In this part of the assignment, we‚Äôll address each of these limitations in turn and measure the impact on
+training speed.
+
+5.3.1 Reducing the Number of Communication Calls
+Rather than issuing a communication call for each parameter tensor, let‚Äôs see if we can improve
+performance by batching the all-reduce. Concretely, we‚Äôll take the gradients that we want to all-reduce,
+concatenate them into a single tensor, and then all-reduce the combined gradients across all ranks. It
+might be helpful to use torch._utils._flatten_dense_tensors and
+torch._utils._unflatten_dense_tensors.
+
+  Problem (minimal_ddp_flat_benchmarking): Minimal DDP with Flat Gradients
+  Benchmarking (2 points)
+
+     Modify your minimal DDP implementation to communicate a tensor with flattened gradients
+     from all parameters. Compare its performance with the minimal DDP implementation that issues
+     an all-reduce for each parameter tensor under the previously-used conditions (1 node x 2 GPUs,
+     xl model size as described in Section 2.1.2).
+
+     Deliverable: The measured time per training iteration and time spent communicating gradients
+     under distributed data parallel training with a single batched all-reduce call. 1-2 sentences
+     comparing the results when batching vs. individually communicating gradients.
+
+5.3.2 Overlapping Computation with Communication of Individual Parameter Gradients
+While batching the communication calls might help lower the overhead associated with issuing a large
+number of small all-reduce operations, all of the communication time still directly contributes to the
+overhead. To resolve this, we can take advantage of the observation that the backward pass incrementally
+computes gradients for each layer (starting from the loss and moving toward the input)‚Äîthus, we can all-
+reduce parameter gradients as soon as they‚Äôre ready, reducing the overhead of data parallel training by
+overlapping computation of the backward pass with communication of gradients.
+
+We‚Äôll start by implementing and benchmarking a distributed data parallel wrapper that asynchronously
+all-reduces individual parameter tensors as they become ready during the backward pass. The following
+pointers may be useful:
+
+Backward hooks To automatically call a function on a parameter after its gradient has been
+accumulated in the backward pass, you can use the register_post_accumulate_grad_hook function.4
+
+   4See https://pytorch.org/docs/stable/generated/torch.Tensor.register_post_accumulate_grad_hook.html for more
+information and usage examples.
+
+                                                                     34
+Asynchronous communication All PyTorch collective communication operations support
+synchronous (async_op=False) and asynchronous execution (async_op=True). Synchronous calls will block
+until the collective operation is queued on the GPU. This does not mean that the CUDA operation is
+completed since CUDA operations are asynchronous. That being said, later function calls using the
+output will behave as expected.5 In contrast, asynchronous calls will return a distributed request handle‚Äî
+as a result, when the function returns, the collective communication operation is not guaranteed to have
+been queued on the GPU, let alone completed. To wait for the operation to be queued on the GPU (and
+therefore for the output to be usable in later operations), you can call handle.wait() on the returned
+communication handle.
+
+For example, the following two examples all-reduce each tensor in a list of tensors with either a
+synchronous or an asynchronous call:
+
+   tensors = [torch.rand(5) for _ in range(10)]
+
+   # Synchronous, block until operation is queued on the GPU.
+   for tensor in tensors:
+
+          dist.all_reduce(tensor, async_op=False)
+
+   # Asynchronous, return immediately after each call and
+   # wait on results at the end.
+   handles = []
+   for tensor in tensors:
+
+          handle = dist.all_reduce(tensor, async_op=True)
+          handles.append(handle)
+
+   # ...
+   # Possibly execute other commands that don't rely on the all_reduce results
+   # ...
+
+   # Ensure that all-reduce calls were queued and
+   # therefore other operations depending on the
+   # all-reduce output can be queued.
+   for handle in handles:
+
+          handle.wait()
+   handles.clear()
+
+  Problem (ddp_overlap_individual_parameters): DDP with Overlapping Individual
+  Parameters (5 points)
+
+     Implement a Python class to handle distributed data parallel training. The class should wrap an
+     arbitrary PyTorch nn.Module and take care of broadcasting the weights before training (so all
+     ranks have the same initial parameters) and issuing communication calls for gradient averaging.
+     We recommend the following public interface:
+
+     def __init__(self, module: torch.nn.Module): Given an instantiated PyTorch nn.Module to be
+         parallelized, construct a DDP container that will handle gradient synchronization across ranks.
+
+     def forward(self, *inputs, **kwargs): Calls the wrapped module‚Äôs forward() method with the
+         provided positional and keyword arguments.
+
+   5In advanced cases, if you are using multiple CUDA streams, you may need explicit synchronization across streams to
+ensure that the output is ready for later operations. See https://pytorch.org/docs/stable/notes/cuda.html\#cuda-streams.
+
+                                                                     35
+   def finish_gradient_synchronization(self): When called, wait for asynchronous communication
+       calls to finish on the GPU.
+
+   To use this class to perform distributed training, we‚Äôll pass it a module to wrap, and then add a
+   call to finish_gradient_synchronization() before we run optimizer.step() to ensure that the
+   optimizer step, an operation that depends on the gradients, can be safely queued:
+
+      model = ToyModel().to(device)
+      ddp_model = DDP(model)
+
+      for _ in range(train_steps):
+              x, y = get_batch()
+              logits = ddp_model(x)
+              loss = loss_fn(logits, y)
+              loss.backward()
+              ddp_model.finish_gradient_synchronization()
+              optimizer.step()
+
+   Deliverable: Implement a container class to handle distributed data parallel training. This class
+   should overlap gradient communication and the computation of the backward pass. To test your
+   DDP class, first implement the adapters [adapters.get_ddp] and
+   [adapters.ddp_on_after_backward] (the latter is optional, depending on your implementation you
+   may not need it).
+   Then, to execute the tests, run uv run pytest tests/test_ddp.py. We recommend running the
+   tests multiple times (e.g., 5) to ensure that it passes reliably.
+
+Problem (ddp_overlap_individual_parameters_benchmarking): DDP Overlapping Individual
+Parameters Benchmarking (1 point)
+
+   (a) Benchmark the performance of your DDP implementation when overlapping backward pass
+        computation with communication of individual parameter gradients. Compare its performance
+        with our previously-studied settings (the minimal DDP implementation that either issues an
+        all-reduce for each parameter tensor, or a single all-reduce on the concatenation of all
+        parameter tensors) with the same setup: 1 node, 2 GPUs, and the xl model size described in
+        Section 2.1.2.
+        Deliverable: The measured time per training iteration when overlapping the backward pass
+        with communication of individual parameter gradients, with 1-2 sentences comparing the
+        results.
+
+   (b) Instrument your benchmarking code (using the 1 node, 2 GPUs, xl model size setup) with the
+        Nsight profiler, comparing the initial DDP implementation with this overlapped
+        implementation. Visually compare the two traces, and provide a profiler screenshot
+        demonstrating that one implementation overlaps compute with communication while the
+        other doesn‚Äôt.
+        Deliverable: 2 screenshots (one from the initial DDP implementation, and another from this
+        DDP implementation that overlaps compute with communication) that visually show that
+        communication is or isn‚Äôt overlapped with the backward pass.
+
+                                                                   36
+6 Optimizer State Sharding
+
+Distributed data parallel training is conceptually simple and often very effective, but requires each rank
+to hold a distinct copy of the model parameters and optimizer state. This redundancy can come with
+significant memory costs. For example, the AdamW optimizer maintains two floats per parameter,
+meaning that it consumes twice as much memory as the model weights. S. Rajbhandari et al. [5] describe
+several methods for reducing this redundancy in data-parallel training by partitioning the (1) optimizer
+state, (2) gradients, and (3) parameters across ranks, communicating them between workers as necessary.
+In this part of the assignment, we‚Äôll reduce per-rank memory consumption by implementing a simplified
+version of optimizer state sharding. Rather than keeping the optimizer states for all parameters, each
+rank‚Äôs optimizer instance will only handle a subset of the parameters (approximately 1 / world_size).
+When each rank‚Äôs optimizer takes an optimizer step, it‚Äôll only update the subset of model parameters in
+its shard. Then, each rank will broadcast its updated parameters to the other ranks to ensure that the
+model parameters remain synchronized after each optimizer step.
+
+  Problem (optimizer_state_sharding): Optimizer State Sharding (15 points)
+
+     Implement a Python class to handle optimizer state sharding. The class should wrap an arbitrary
+     input PyTorch optim.Optimizer and take care of synchronizing updated parameters after each
+     optimizer step. We recommend the following public interface:
+     def __init__(self, params, optimizer_cls: Type[Optimizer], **kwargs: Any): Initializes the
+
+         sharded state optimizer. params is a collection of parameters to be optimized (or parameter
+         groups, in case the user wants to use different hyperparameters, such as learning rates, for
+         different parts of the model); these parameters will be sharded across all the ranks. The
+         optimizer_cls parameter specifies the type of optimizer to be wrapped (e.g., optim.AdamW).
+         Finally, any remaining keyword arguments are forwarded to the constructor of the
+         optimizer_cls. Make sure to call the torch.optim.Optimizer super-class constructor in this
+         method.
+     def step(self, closure, **kwargs): Calls the wrapped optimizer‚Äôs step() method with the
+         provided closure and keyword arguments. After updating the parameters, synchronize with the
+         other ranks.
+     def add_param_group(self, param_group: dict[str, Any]): This method should add a parameter
+         group to the sharded optimizer. This is called during construction of the sharded optimizer by
+         the super-class constructor and may also be called during training (e.g., for gradually
+         unfreezing layers in a model). As a result, this method should handle assigning the model‚Äôs
+         parameters among the ranks.
+     Deliverable: Implement a container class to handle optimizer state sharding. To test your
+     sharded optimizer, first implement the adapter [adapters.get_sharded_optimizer] . Then, to
+     execute the tests, run uv run pytest tests/test_sharded_optimizer.py. We recommend running
+     the tests multiple times (e.g., 5) to ensure that they pass reliably.
+
+Now that we‚Äôve implemented optimizer state sharding, let‚Äôs analyze its effect on the peak memory usage
+during training and its runtime overhead.
+
+                                                                     37
+  Problem (optimizer_state_sharding_accounting): Optimizer State Sharding Accounting (5
+  points)
+
+     (a) Create a script to profile the peak memory usage when training language models with and
+          without optimizer state sharding. Using the standard configuration (1 node, 2 GPUs, xl
+          model size), report the peak memory usage after model initialization, directly before the
+          optimizer step, and directly after the optimizer step. Do the results align with your
+          expectations? Break down the memory usage in each setting (e.g., how much memory for
+          parameters, how much for optimizer states, etc.).
+          Deliverable: 2-3 sentence response with peak memory usage results and a breakdown of how
+          the memory is divided between different model and optimizer components.
+
+     (b) How does our implementation of optimizer state sharding affect training speed? Measure the
+          time taken per iteration with and without optimizer state sharding for the standard
+          configuration (1 node, 2 GPUs, xl model size).
+          Deliverable: 2-3 sentence response with your timings.
+
+     (c) How does our approach to optimizer state sharding differ from ZeRO stage 1 (described as
+          ZeRO-DP Ì†µÌ±ÉÌ†µÌ±úÌ†µÌ±† in S. Rajbhandari, J. Rasley, O. Ruwase, and Y. He [5])?
+          Deliverable: 2-3 sentence summary of any differences, especially those related to memory
+          and communication volume.
+
+7 Fully-Sharded Data Parallel
+
+With optimizer state sharding and data parallel, we‚Äôre able to split the optimizer state and activations
+across our data-parallel axis. However, our model weights remain duplicated ‚Äî we‚Äôre storing a full copy
+of them all on each GPU.
+We can solve this by turning our data parallel (DP) axis into a fully-sharded data parallel axis (FSDP).
+With FSDP, each GPU stores only its own slice of every weight tensor, but has to pull slices from other
+GPUs to form the full weight tensor using an all-gather to prepare for a forward or backward pass.
+To avoid keeping GPU compute waiting around for communication to finish, most FSDP implementations
+schedule the layer‚Äôs all-gather in advance of the operation, meaning the relevant weights are ready before
+they are needed, preventing communication from blocking computation. This keeps weight sharding
+communication off the critical path, meaning it has no cost as long as communication can keep up with
+compute and is scheduled well.
+Some layers are small enough in memory and compute that the latency overhead of a transfer is not
+worth it. You should mark these layers not to be sharded by FSDP. In our architecture, this will mostly
+be the case for norms. This leaves us with the embedding layer and every linear layer.
+While it is necessary to store master weights in FP32 (any values that are repeatedly accumulated into
+are sensitive to precision), the weights do not need to be used in FP32. In mixed precision, we always
+convert to the low-precision compute datatype before use, so we may as well convert even before the
+weight is communicated to save on bandwidth.
+
+  Problem (fsdp): Fully-Sharded Data Parallel (15 points)
+
+                                                                     38
+     Implement a Python class for fully-sharded data parallel training. The class should wrap an
+     arbitrary PyTorch nn.Module (your full model) and hook into or wrap any Linear or Embedding
+     layer within it. We recommend the following public interface:
+
+      def __init__(self, module: torch.nn.Module, compute_dtype: torch.dtype | None = None):
+
+         Given an instantiated PyTorch nn.Module to be parallelized, construct an FSDP module that
+         will handle weight all-gathers and gradient reduce-scatters. Make sure that your hooks or your
+         module wrappers all-gather the weights in time for the forward pass. To limit memory use,
+         only start gathering after the layer two before the current one has completed its forward pass.
+         In the backward pass, your hooks or module wrappers should all-gather to have the weights
+         available for the computation. When the gradients are available, they should be reduce-
+         scattered to the appropriate ranks. Make sure to free the gathered weights after use. When
+         compute_dtype is provided, cast the weights to that dtype before communicating or using them
+         for compute, while keeping master weights and optimizer updates in FP32.
+     def forward(self, *inputs, **kwargs): Calls the wrapped module‚Äôs forward() method with the
+         provided positional and keyword arguments.
+     def finish_gradient_synchronization(self): When called, wait for asynchronous communication
+         calls to finish on the GPU.
+     Deliverable: Implement a container class to handle fully sharded data parallel training. Each
+     shard of this container should be compatible with the standard AdamW implementation from
+     assignment 1. To test your FSDP implementation, implement the adapter [adapters.get_fsdp] .
+     Run the tests with uv run pytest tests/test_fsdp.py. We recommend running the tests multiple
+     times (e.g., 5) to catch any race conditions.
+
+  Problem (fsdp_accounting): FSDP Accounting (5 points)
+
+     (a) Given your analysis in Section 6, how much memory do you expect to save from the peak by
+          implementing FSDP? You can ignore the size of the preallocated buffers needed to all-gather
+          weights to each GPU in your calculation.
+          Deliverable: 2-3 sentence response with your findings.
+
+     (b) Profile the xl model on two GPUs and pay attention to the all-gather of weights. Does the
+          communication finish in time for the forward pass?
+          Deliverable: 2-3 sentence response with your timings. Include screenshots of Nsight to back
+          up your claims.
+
+8 Analyzing Parallelism Strategies
+
+There are more axes along which we can parallelize our training process. Some common strategies
+include:
+‚Ä¢ Data parallelism (DP) ‚Äî Batches of data are split across multiple devices, and each device
+
+   computes gradients for its own batch. Gradients are then averaged across devices.
+‚Ä¢ Fully-Sharded Data Parallelism (FSDP) ‚Äî On top of data parallelism, we also split optimizer
+
+   states, gradients, and weights across devices to reduce memory usage. Devices then need to gather
+   weight shards from other devices during the forward and backward passes.
+
+                                                                     39
+‚Ä¢ Tensor Parallelism (TP) ‚Äî Weight matrices are sharded across the input or output dimension.
+   Devices compute the activations corresponding to their shard, and activations are then reduced or
+   gathered across devices.
+
+‚Ä¢ Pipeline Parallelism (PP) ‚Äî The model is split layerwise into multiple stages, where each stage is
+   run on a different device.
+
+‚Ä¢ Expert Parallelism (EP) ‚Äî The experts in a Mixture-of-Experts model are split onto different
+   devices, and each device computes the output for its own expert.
+
+In this section, we‚Äôll do some basic math in a simplified setting to choose between parallelism strategies
+and decide how to combine them. To start, we‚Äôll focus on DP, FSDP, TP, and their combinations. Our
+approach will be to calculate the communication cost of each strategy and compare it to the
+computational cost, which tells us how many devices we can scale to before communication cost becomes
+the bottleneck.
+
+For a more detailed treatment of TPU/GPU topologies and parallelism strategies, the TPU Scaling Book
+(J. Austin et al. [6]) is an excellent resource. And for a more detailed pipeline parallel discussion, see
+The Ultra-Scale Playbook Appendix (H. Z. P. N. M. M. L. W. T. W. Nouamane Tazi Ferdinand Mom
+[7]). The rest of these books also have a lot of other information you might find useful.
+
+8.1 Communication Primitives
+
+Our first step will be to understand the communication primitives. In our simplified setting, suppose we
+have Ì†µÌ±Å devices numbered 0, ‚Ä¶, Ì†µÌ±Å ‚àí 1, and each pair of devices is connected by a link. We‚Äôll also assume
+each device has Ì†µÌ±ä egress (i.e. outgoing) bandwidth; in other words, each device can send data to another
+device at a rate of Ì†µÌ±ä bytes per second. How might we implement gather and reduce?
+
+One common way to implement the all-gather operation is the ring all-gather. Recall that in an all-
+
+gather,  each   device  Ì†µÌ±ñ   starts    with   a  chunk   Ì†µÌ±•Ì†µÌ±ñ  of   size  Ì†µÌ±Ü  ,  and  ends    up  with      the  entire   Ì†µÌ±•  =   [Ì†µÌ±•0, ‚Ä¶, Ì†µÌ±•Ì†µÌ±Å‚àí1]  of
+                                                                          Ì†µÌ±Å
+
+size Ì†µÌ±Ü (in bytes). In a ring all-gather, we arrange the devices in a circle. In each step, each device sends
+
+its current chunk to the next device to its right, and stores the chunk it received from the device to its
+
+left. This process repeats, where each device passes the chunk it just received to the right, and receives a
+
+new chunk from the left. After Ì†µÌ±Å ‚àí 1 steps, each device has the entire tensor.
+
+In  our  idealized    setting,   each      device   simultaneously        transmits     a    chunk     of   size  Ì†µÌ±Ü  in  each    step,  with  egress
+                                                                                                                  Ì†µÌ±Å
+                                                                                                       Ì†µÌ±Å‚àí1 Ì†µÌ±Ü
+bandwidth       Ì†µÌ±ä ,  and there are Ì†µÌ±Å ‚àí 1          steps, so  the      ring     all-gather takes        Ì†µÌ±Å Ì†µÌ±ä    seconds.
+
+Next, let‚Äôs analyze the ring reduce-scatter. In a reduce-scatter, each device Ì†µÌ±ñ starts with a full tensor
+
+Ì†µÌ±•(Ì†µÌ±ñ) of size Ì†µÌ±Ü. We then want to compute the reduction Ì†µÌ±¶ = ‚àëÌ†µÌ±Å‚àí1 Ì†µÌ±•(Ì†µÌ±ñ), but where each device Ì†µÌ±ñ ends up
+                                                                                        Ì†µÌ±ñ=0
+                                       Ì†µÌ±Ü
+with   just  a  chunk  Ì†µÌ±¶Ì†µÌ±ñ  of  size  Ì†µÌ±Å  .  Like  the  ring  all-gather,       we‚Äôll  start    by  arranging        the  devices   in     a  circle.
+
+Each   device   will  first  divide    its    tensor  Ì†µÌ±•(Ì†µÌ±ñ)  into  Ì†µÌ±Å  chunks   [Ì†µÌ±•(0Ì†µÌ±ñ), ‚Ä¶, Ì†µÌ±•Ì†µ(Ì†µÌ±ÅÌ±ñ)‚àí1],  each  of  size    Ì†µÌ±Ü  .  We‚Äôll  then  pass
+                                                                                                                              Ì†µÌ±Å
+
+chunks around just like the ring all-gather, except before passing the chunk on, each device adds its
+
+contribution to the chunk (which stores a partial sum). Specifically:
+
+For step Ì†µÌ±° = 1, ‚Ä¶, Ì†µÌ±Å ‚àí 1, device Ì†µÌ±ñ does the following:
+
+‚Ä¢ If Ì†µÌ±° = 1, initialize Ì†µÌ±¶ ‚Üê Ì†µÌ±•(Ì†µÌ±ñ), which stores the partial sum so far
+
+‚Ä¢ Send chunk Ì†µÌ±¶(Ì†µÌ±ñ‚àíÌ†µÌ±°) mod Ì†µÌ±Å to device (Ì†µÌ±ñ + 1) mod Ì†µÌ±Å
+
+‚Ä¢ Receive chunk Ì†µÌ±ß(Ì†µÌ±ñ‚àíÌ†µÌ±°‚àí1) mod Ì†µÌ±Å from device (Ì†µÌ±ñ ‚àí 1) mod Ì†µÌ±Å
+
+‚Ä¢ Update your copy of the partial sum: Ì†µÌ±¶(Ì†µÌ±ñ‚àíÌ†µÌ±°‚àí1) mod Ì†µÌ±Å ‚Üê Ì†µÌ±¶(Ì†µÌ±ñ‚àíÌ†µÌ±°‚àí1) mod Ì†µÌ±Å + Ì†µÌ±ß(Ì†µÌ±ñ‚àíÌ†µÌ±°‚àí1) mod Ì†µÌ±Å
+
+After  Ì†µÌ±Å  ‚àí1   steps,  device   Ì†µÌ±ñ    then   has   the  full  sum      for   chunk   Ì†µÌ±¶Ì†µÌ±ñ,  so  ring  reduce-scatter         takes  Ì†µÌ±Å‚àí1 Ì†µÌ±Ü
+                                                                                                                                       Ì†µÌ±Å Ì†µÌ±ä
+
+seconds, just like ring all-gather.
+
+                                                                          40
+Finally, let‚Äôs implement ring all-reduce. In an all-reduce, each device Ì†µÌ±ñ starts with a full tensor Ì†µÌ±•(Ì†µÌ±ñ) of
+
+size Ì†µÌ±Ü, and ends up with the reduction Ì†µÌ±¶ = ‚àëÌ†µÌ±Å‚àí1 Ì†µÌ±•(Ì†µÌ±ñ). We‚Äôll implement all-reduce as a ring reduce-
+                                                     Ì†µÌ±ñ=0
+                                                                                       Ì†µÌ±Å ‚àí1  Ì†µÌ±Ü
+scatter  followed by    a  ring  all-gather,  so  the  ring  all-reduce      takes  2    Ì†µÌ±Å   Ì†µÌ±ä  seconds.
+
+Problem (alternate_ring_all_reduce): Alternate ring all-reduce (1 point)
+
+Instead of implementing all-reduce as a ring reduce-scatter followed by a ring all-gather, let‚Äôs use
+the following algorithm:
+
+For step Ì†µÌ±° = 1, ‚Ä¶, Ì†µÌ±Å ‚àí 1, device Ì†µÌ±ñ does the following:
+‚Ä¢ If Ì†µÌ±° = 1, initialize Ì†µÌ±¶ ‚Üê Ì†µÌ±•(Ì†µÌ±ñ), which stores the partial sum so far
+‚Ä¢ Send Ì†µÌ±•((Ì†µÌ±ñ‚àíÌ†µÌ±°+1) mod Ì†µÌ±Å) to device (Ì†µÌ±ñ + 1) mod Ì†µÌ±Å
+‚Ä¢ Receive Ì†µÌ±•((Ì†µÌ±ñ‚àíÌ†µÌ±°) mod Ì†µÌ±Å) from device (Ì†µÌ±ñ ‚àí 1) mod Ì†µÌ±Å
+‚Ä¢ Update your copy of the partial sum: Ì†µÌ±¶ ‚Üê Ì†µÌ±¶ + Ì†µÌ±•((Ì†µÌ±ñ‚àíÌ†µÌ±°) mod Ì†µÌ±Å)
+In the same setting as above (Ì†µÌ±ä egress bandwidth per device, each Ì†µÌ±•(Ì†µÌ±ñ) is of size Ì†µÌ±Ü), how long
+does this algorithm take?
+
+Deliverable: An answer in terms of Ì†µÌ±Ü, Ì†µÌ±Å , and Ì†µÌ±ä , along with a one-sentence justification.
+
+8.2 Analyzing Data Parallel
+
+Given our communication primitives, we are ready to analyze parallelism strategies. We‚Äôll analyze the
+parallelization of a single FFN layer. Recall that given input Ì†µÌ≤ô, our forward pass is given by the following:
+
+                                                     Ì†µÌ≤ôÌ†µÌøè = Ì†µÌ≤ôÌ†µÌ±æÌ†µÌøè                                                                       (20)
+
+                                                     Ì†µÌ≤ôÌ†µÌøê = Ì†µÌ≤ôÌ†µÌ±æÌ†µÌøê                                                                       (21)
+
+                                                       Ì†µÌ≤õ = Ì†µÌ±ì(Ì†µÌ≤ôÌ†µÌøè) ‚àó Ì†µÌ≤ôÌ†µÌøê                                                              (22)
+
+                                                       Ì†µÌ≤ö = Ì†µÌ≤õÌ†µÌ±æÌ†µÌøë,                                                                      (23)
+
+where Ì†µÌ≤ô has shape (Ì†µÌ∞µ, Ì†µÌ∞∑), Ì†µÌ±æÌ†µÌøè and Ì†µÌ±æÌ†µÌøê have shape (Ì†µÌ∞∑, Ì†µÌ∞∑FF), and Ì†µÌ±æÌ†µÌøë has shape (Ì†µÌ∞∑FF, Ì†µÌ∞∑). Ì†µÌ±ì is our
+elementwise activation function (e.g. SiLU), and ‚àó represents elementwise multiplication.
+
+It will also be useful to explicitly write out the backward pass. Recall that given Ì†µÌ≤ÖÌ†µÌ≤ö with shape (Ì†µÌ∞µ, Ì†µÌ∞∑),
+the backward pass is given by the following:
+
+                                                  Ì†µÌ≤ÖÌ†µÌ≤õ = Ì†µÌ≤ÖÌ†µÌ≤öÌ†µÌ±æÌ†µÌøë‚ä§                                                                       (24)
+
+                                              Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µÌøê = Ì†µÌ≤ÖÌ†µÌ≤õ ‚àó Ì†µÌ±ì(Ì†µÌ≤ôÌ†µÌøè)                                                                   (25)
+
+                                              Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µÌøè = Ì†µÌ≤ÖÌ†µÌ≤õ ‚àó Ì†µÌ±ì‚Ä≤(Ì†µÌ≤ôÌ†µÌøè) ‚àó Ì†µÌ≤ôÌ†µÌøê                                                           (26)
+
+                                                  Ì†µÌ≤ÖÌ†µÌ≤ô = Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µÌøèÌ†µÌ±æÌ†µÌøè‚ä§ + Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µÌøêÌ†µÌ±æÌ†µÌøê‚ä§                                                       (27)
+
+                                            Ì†µÌ≤ÖÌ†µÌ±æÌ†µÌøë = Ì†µÌ≤õ‚ä§Ì†µÌ≤ÖÌ†µÌ≤ö                                                                             (28)
+
+                                            Ì†µÌ≤ÖÌ†µÌ±æÌ†µÌøê = Ì†µÌ≤ô‚ä§Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µÌøê                                                                           (29)
+
+                                            Ì†µÌ≤ÖÌ†µÌ±æÌ†µÌøè = Ì†µÌ≤ô‚ä§Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µÌøè,                                                                          (30)
+
+where ‚àó represents elementwise multiplication.
+
+Recall  that  in  data  parallelism  with   Ì†µÌ±ÅDP  devices,  we  shard   our     input  Ì†µÌ≤ô  into   shards  Ì†µÌ≤ô(Ì†µÌ≤ä)  of  size  (   Ì†µÌ∞µ    ,  Ì†µÌ∞∑).
+                                                                                                                               Ì†µÌ±ÅDP
+                                                                                                        Ì†µÌ≤ö(Ì†µÌ≤ä)                Ì†µÌ∞µ
+The  forward  pass  proceeds     as  usual  without  any   collectives,  producing         activations          of  size  (  Ì†µÌ±ÅDP  ,  Ì†µÌ∞∑).  In
+
+                                                             41
+the backward pass, proceeding as usual with the batch-sharded activations, device Ì†µÌ±ñ ends up with
+gradients
+
+                                                   Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä) = Ì†µÌ≤õ(Ì†µÌ≤ä)‚ä§Ì†µÌ≤ÖÌ†µÌ≤ö(Ì†µÌ≤ä)                                                  (31)
+                                                   Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä) = Ì†µÌ≤ô(Ì†µÌ≤ä)‚ä§Ì†µÌ≤ÖÌ†µÌ≤ô(Ì†µÌøêÌ†µÌ≤ä)                                                (32)
+                                                   Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä) = Ì†µÌ≤ô(Ì†µÌ≤ä)‚ä§Ì†µÌ≤ÖÌ†µÌ≤ôÌ†µ(ÌøèÌ†µÌ≤ä),                                               (33)
+
+where  instead  of  summing  over  all  Ì†µÌ∞µ  outer  products,  we  only   have       the    partial  sum  over  the   Ì†µÌ∞µ   outer
+                                                                                                                    Ì†µÌ±ÅDP
+
+products for our shard of the input. Then, we need to do an all-reduce across devices to get the full
+
+gradients Ì†µÌ≤ÖÌ†µÌ±æÌ†µÌøë, Ì†µÌ≤ÖÌ†µÌ±æÌ†µÌøê, and Ì†µÌ≤ÖÌ†µÌ±æÌ†µÌøè.
+
+Problem (data_parallel_calcs): Data parallel calculations (3 points)
+
+We now have everything we need to calculate when data parallelism becomes communication
+bottlenecked. Let Ì†µÌ∞∂ (in FLOP/s) denote the device accelerator speed, and Ì†µÌ±ä (in bytes per
+second) denote each device‚Äôs egress bandwidth. We can then compute the computation time and
+communication time. Because computation and communication can be overlapped, we are
+bottlenecked when communication time becomes larger than computation time. We‚Äôll assume that
+all weights and activations are in FP16 (i.e. two bytes).
+
+(a) How many FLOPs are required to compute the backward pass, with Ì†µÌ±ÅDP data parallelism?
+     You can ignore all non-matmul operations. Recall that a matmul (Ì†µÌ∞¥, Ì†µÌ∞µ)(Ì†µÌ∞µ, Ì†µÌ∞∂) ‚Üí (Ì†µÌ∞¥, Ì†µÌ∞∂) takes
+     2Ì†µÌ∞¥Ì†µÌ∞µÌ†µÌ∞∂ flops.
+
+     Deliverable: An answer in terms of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, and Ì†µÌ±ÅDP, along with a one-sentence
+     justification.
+
+(b) How much communication time is required in the backward pass, with Ì†µÌ±ÅDP data parallelism?
+
+     Deliverable: An answer in terms of a subset of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ±ÅDP, and Ì†µÌ±ä , along with a one-
+     sentence justification.
+
+(c) Fixing the other parameters, how large can Ì†µÌ±ÅDP become before we‚Äôre communication
+     bottlenecked?
+
+     Deliverable: An inequality with Ì†µÌ±ÅDP on one side, and an expression in terms of a subset of
+     Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ∞∂, and Ì†µÌ±ä on the other, along with a one-sentence justification.
+
+8.3 Analyzing Fully Sharded Data Parallel
+
+Next, let‚Äôs analyze FSDP. Recall that just like DP, FSDP shards the batch dimension of the inputs and
+
+activations. In addition, to save on memory, we also shard the optimizer states, gradients, and weights.
+
+We can shard the weights along either dimension, producing shards Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä), Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä), and Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä) on device Ì†µÌ±ñ,
+                . Ì†µÌ∞∑Ì†µÌ∞∑FF
+each  of  size
+                Ì†µÌ±ÅFSDP
+
+In the forward pass, we will just do the data parallel forward pass on the batch-sharded input. But to do
+
+so, recall that we need to first all-gather the weight shards across devices:
+
+                                                             ({Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP   ‚àí1
+
+                                        Ì†µÌ±æÌ†µÌøè  =  all-gather              }              )                                        (34)
+                                                                                                                                 (35)
+                                                                         Ì†µÌ±ñ=0
+
+                                                             ({Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP   ‚àí1
+
+                                        Ì†µÌ±æÌ†µÌøê  =  all-gather              }              )
+
+                                                                         Ì†µÌ±ñ=0
+
+                                                             42
+                           ({Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP  ‚àí1
+
+Ì†µÌ±æÌ†µÌøë        =  all-gather              }             )                                                  (36)
+
+                                       Ì†µÌ±ñ=0
+
+(do batch-sharded forward pass)                                                                         (37)
+
+Note that we have some freedom in when we want to do the all-gather: we just need an all-gathered
+weight before it‚Äôs used, and we should then discard it to keep memory costs low. For simplicity, in this
+section we just list the three all-gathers together.
+
+Like the forward, in the backward pass we need to first all-gather the weight shards across devices. We
+can then do the data parallel backward pass, except we no longer need to do an all-reduce because each
+device only needs the gradient for its shard. Therefore, we do a reduce-scatter instead:
+
+                           ({Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP  ‚àí1
+
+Ì†µÌ±æÌ†µÌøè        =  all-gather              }             )                                                  (38)
+                                                                                                        (39)
+                                       Ì†µÌ±ñ=0                                                             (40)
+
+                           ({Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP  ‚àí1
+
+Ì†µÌ±æÌ†µÌøê        =  all-gather              }             )
+
+                                       Ì†µÌ±ñ=0
+
+                           ({Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP  ‚àí1
+
+Ì†µÌ±æÌ†µÌøë        =  all-gather              }             )
+
+                                       Ì†µÌ±ñ=0
+
+(do batch-sharded backward pass)                                                                        (41)
+
+Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)  =  reduce-scatter  ({Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP‚àí1  )                                              (42)
+                                                                                                        (43)
+                                             }                                                          (44)
+
+                                             Ì†µÌ±ñ=0
+
+Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)  =  reduce-scatter  ({Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP‚àí1  )
+
+                                             }
+
+                                             Ì†µÌ±ñ=0
+
+Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)  =  reduce-scatter  ({Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)    Ì†µÌ±ÅFSDP‚àí1  )
+
+                                             }
+
+                                             Ì†µÌ±ñ=0
+
+Note that the sharding notation (superscript (Ì†µÌ±ñ)) is overloaded: the inputs to the reduce-scatter are
+partial sums on the full weights, while the outputs are full sums on the sharded weights.
+
+Problem (fsdp_calcs): Fully sharded data parallel calculations (3 points)
+
+Under the same setting as the data parallel calculations, let‚Äôs calculate when FSDP becomes
+communication bottlenecked.
+
+(a) How many FLOPs are required to compute the backward pass, with Ì†µÌ±ÅFSDP FSDP? What
+     about the forward pass?
+
+     Deliverable: Two answers in terms of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, and Ì†µÌ±ÅFSDP, along with two one-sentence
+     justifications.
+
+(b) How much communication time is required in the backward pass, with Ì†µÌ±ÅFSDP FSDP? What
+     about the forward pass?
+
+     Deliverable: Two answers in terms of a subset of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ±ÅFSDP, and Ì†µÌ±ä , along with two
+     one-sentence justifications.
+
+(c) Fixing the other parameters, how large can Ì†µÌ±ÅFSDP become before the backward pass is
+     communication bottlenecked? What about the forward pass?
+
+                           43
+         Deliverable: Two inequalities with Ì†µÌ±ÅFSDP on one side, and an expression in terms of a subset
+         of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ∞∂, and Ì†µÌ±ä on the other, along with two one-sentence justifications.
+
+8.4 Analyzing Tensor Parallel
+
+In practice, FSDP is often combined with a parallelism strategy called tensor parallelism (TP). In TP, we
+shard either the input or output dimension of each weight matrix across devices. Input dimension
+sharding is often called ‚Äúrow parallel,‚Äù while output dimension sharding is often called ‚Äúcolumn parallel.‚Äù
+
+Specifically, suppose we want to shard the matmul Ì†µÌ≤ôÌ†µÌ±æ , for Ì†µÌ≤ô with shape (Ì†µÌ∞µ, Ì†µÌ∞∑) and Ì†µÌ±æ with shape
+
+(Ì†µÌ∞∑, Ì†µÌ∞∑FF).  In   column     parallel   we     have       shards    Ì†µÌ±æ (Ì†µÌ≤ä)  of  shape       (Ì†µÌ∞∑,  Ì†µÌ∞∑FF    ),  and     we    have
+                                                                                                   Ì†µÌ±ÅTP
+
+                                               Ì†µÌ≤ôÌ†µÌ±æ = all-gather ({Ì†µÌ≤ôÌ†µÌ±æ (Ì†µÌ≤ä)}Ì†µÌ±ÅTP‚àí1).                                                                            (45)
+
+                                                                                                    Ì†µÌ±ñ=0
+
+On  the  other    hand,  for      row   parallel,      we  have     shards       Ì†µÌ±æ (Ì†µÌ≤ä)     of  shape     (   Ì†µÌ∞∑   ,  Ì†µÌ∞∑FF  ),   and  each  device       also
+                                                                                                              Ì†µÌ±ÅTP
+                                               Ì†µÌ≤ô(Ì†µÌ≤ä)                             Ì†µÌ∞∑
+narrows  the      input  Ì†µÌ≤ô  into  a    slice          with     shape      (Ì†µÌ∞µ,  Ì†µÌ±ÅTP  )     before  doing        the   matmul.        Then,  we  have
+
+                                               Ì†µÌ≤ôÌ†µÌ±æ = all-reduce ({Ì†µÌ≤ô(Ì†µÌ≤ä)Ì†µÌ±æ (Ì†µÌ≤ä)}Ì†µÌ±ÅTP‚àí1).                                                                        (46)
+
+                                                                                                        Ì†µÌ±ñ=0
+
+To parallelize our FFN, we‚Äôll use a specific tensor parallel configuration where Ì†µÌ±æÌ†µÌøè and Ì†µÌ±æÌ†µÌøê are column
+parallel (output-dimension-sharded), while Ì†µÌ±æÌ†µÌøë is row parallel (input-dimension-sharded). Since the row
+parallel weight only requires a slice of the input, this configuration lets us skip the all-gather after the
+
+column parallel weights. This strategy gives the following forward pass, given input Ì†µÌ≤ô of size (Ì†µÌ∞µ, Ì†µÌ∞∑):
+
+                                                          Ì†µÌ≤ôÌ†µ(ÌøèÌ†µÌ≤ä) = Ì†µÌ≤ôÌ†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)                                                                                  (47)
+                                                          Ì†µÌ≤ôÌ†µ(ÌøêÌ†µÌ≤ä) = Ì†µÌ≤ôÌ†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)                                                                                  (48)
+                                                          Ì†µÌ≤õ(Ì†µÌ≤ä) = Ì†µÌ±ì (Ì†µÌ≤ôÌ†µ(ÌøèÌ†µÌ≤ä)) ‚àó Ì†µÌ≤ôÌ†µ(ÌøêÌ†µÌ≤ä)                                                                      (49)
+                                                                                                                                                                 (50)
+                                                          Ì†µÌ≤ö(Ì†µÌ≤ä) = Ì†µÌ≤õ(Ì†µÌ≤ä)Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)                                                                                (51)
+                                                            Ì†µÌ≤ö = all-reduce ({Ì†µÌ≤ö(Ì†µÌ≤ä)}Ì†µÌ±ÅTP‚àí1),
+
+                                                                                                        Ì†µÌ±ñ=0
+
+where  Ì†µÌ±æÌ†µ(Ìøè Ì†µÌ≤ä)  and  Ì†µÌ±æÌ†µ(Ìøê Ì†µÌ≤ä)  have  shape  (Ì†µÌ∞∑,       Ì†µÌ∞∑FF  ),  and    Ì†µÌ±æÌ†µ(Ìøë Ì†µÌ≤ä)  has    shape   (  Ì†µÌ∞∑FF   ,  Ì†µÌ∞∑).
+                                                          Ì†µÌ±ÅTP                                          Ì†µÌ±ÅTP
+
+Problem (tp_calcs): Tensor parallel calculations (4 points)
+
+    Under the same setting as the DP and FSDP calculations, let‚Äôs calculate when TP becomes
+    communication bottlenecked.
+
+    (a) Given input Ì†µÌ≤ÖÌ†µÌ≤ö of size (Ì†µÌ∞µ, Ì†µÌ∞∑) write out the backward pass of the tensor parallel strategy
+
+         described       above    (where       Ì†µÌ±æÌ†µ(Ìøè Ì†µÌ≤ä)  and   Ì†µÌ±æÌ†µ(Ìøê Ì†µÌ≤ä)  have  shape       (Ì†µÌ∞∑,    Ì†µÌ∞∑FF  ),  and     Ì†µÌ±æÌ†µ(Ìøë Ì†µÌ≤ä)  has  shape  (  Ì†µÌ∞∑FF  ,  Ì†µÌ∞∑)).
+                                                                                                     Ì†µÌ±ÅTP                                        Ì†µÌ±ÅTP
+
+         Deliverable: A series of equations describing the backward pass, in terms of Ì†µÌ≤ÖÌ†µÌ≤ö, sharded
+         weights (Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä), Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä), Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)), activations saved from the forward pass (Ì†µÌ≤ô, Ì†µÌ≤ô(Ì†µÌøèÌ†µÌ≤ä), Ì†µÌ≤ô(Ì†µÌøêÌ†µÌ≤ä), Ì†µÌ≤õ(Ì†µÌ≤ä), Ì†µÌ≤ö(Ì†µÌ≤ä)),
+
+         communication primitives, and any intermediate variables you‚Äôd like to define. The equations
+         should produce each device‚Äôs gradients Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä), Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä), Ì†µÌ≤ÖÌ†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä), and the backward pass output
+
+         Ì†µÌ≤ÖÌ†µÌ≤ô. Feel free to reference the non-sharded backward pass in Section 8.2 and modify it.
+
+    (b) How many FLOPs are required to compute the forward pass, with Ì†µÌ±ÅTP TP? What about the
+         backward pass?
+
+                                                                                 44
+          Deliverable: Two answers in terms of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, and Ì†µÌ±ÅTP, along with two one-sentence
+          justifications.
+
+     (c) How much communication time is required in the forward pass, with Ì†µÌ±ÅTP TP? What about
+          the backward pass?
+
+          Deliverable: Two answers in terms of a subset of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ±ÅTP, and Ì†µÌ±ä , along with two
+          one-sentence justifications.
+
+     (d) Fixing the other parameters, how large can Ì†µÌ±ÅTP become before the backward pass is
+          communication bottlenecked? What about the forward pass?
+
+          Deliverable: Two inequalities with Ì†µÌ±ÅTP on one side, and an expression in terms of a subset
+          of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ∞∂, and Ì†µÌ±ä on the other, along with two one-sentence justifications.
+
+8.5 2D Parallelism (FSDP + TP)
+
+We‚Äôre finally ready to combine parallelism strategies! In this section, we‚Äôll look at how to optimally
+combine FSDP and TP. Hint: in the previous sections, you should have found that your batch size and
+model size parameters limit how many devices you can scale to, where making everything larger allows
+you to keep scaling devices without being communication bottlenecked. Unfortunately, scaling batch size
+past a certain point starts to degrade performance because gradients noise shrinks significantly, losing the
+implicit regularization properties of SGD; this point is often called the ‚Äúcritical batch size.‚Äù And scaling
+laws often tell us how large we want the model to be (that will be your job in the next assignment!).
+
+In this section, we‚Äôll consider a simplified setting where someone comes to you with all of the problem
+parameters (batch size, model size, bandwidth, accelerator speed). Your job will be to choose a
+configuration of FSDP and TP that scales to as many devices as possible, while remaining compute-
+bound rather than communication-bound.
+
+Let‚Äôs first walk through the mechanics of combining FSDP with TP. Each device will have a TP rank Ì†µÌ±ñ =
+0, ‚Ä¶, Ì†µÌ±ÅTP ‚àí 1 and an FSDP rank Ì†µÌ±ó = 0, ‚Ä¶, Ì†µÌ±ÅFSDP ‚àí 1, forming a 2D grid with Ì†µÌ±Å = Ì†µÌ±ÅTPÌ†µÌ±ÅFSDP devices
+total. Following TP, we‚Äôll first shard Ì†µÌ±æÌ†µÌøè and Ì†µÌ±æÌ†µÌøê along the output dimension, and Ì†µÌ±æÌ†µÌøë along the input
+dimension. As a result, we‚Äôll have to insert a TP-style all-reduce on the activations. Next, applying FSDP,
+we‚Äôll shard the batch dimension of the inputs, and we‚Äôll also further shard each weight matrix along
+whichever dimension wasn‚Äôt sharded by TP. Then, we‚Äôll have to insert FSDP-style all-gathers on the
+weights before doing our TP-style forward/backward passes, and reduce-scatters on the weight gradients
+after our TP-style backward pass.
+
+The  result        is  that  each  device      (Ì†µÌ±ñ, Ì†µÌ±ó)  holds    the   weight       shards   Ì†µÌ±æÌ†µ(Ìøè Ì†µÌ≤ä,Ì†µÌ≤ã)  and  Ì†µÌ±æÌ†µ(Ìøê Ì†µÌ≤ä,Ì†µÌ≤ã)  with  shape  (    Ì†µÌ∞∑    ,  Ì†µÌ∞∑FF  ),
+                                                                                                                                               Ì†µÌ±ÅFSDP     Ì†µÌ±ÅTP
+     Ì†µÌ±æÌ†µ(Ìøë Ì†µÌ≤ä,Ì†µÌ≤ã)                     Ì†µÌ∞∑FF
+and                with  shape     (  Ì†µÌ±ÅTP  ,    Ì†µÌ∞∑    ).  We     can   then  write      out  the   forward        pass  as    the   following,  given
+                                               Ì†µÌ±ÅFSDP
+
+batch-sharded          input  Ì†µÌ≤ô(Ì†µÌ≤ã)  of    size  (      Ì†µÌ∞µ    ,  Ì†µÌ∞∑):
+                                                       Ì†µÌ±ÅFSDP
+
+                                                       Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)   =  all-gather      ({Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä,Ì†µÌ≤ã)    Ì†µÌ±ÅFSDP‚àí1  )                                               (52)
+
+                                                                                                    }
+
+                                                                                                    Ì†µÌ±ó=0
+
+                                                       Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)   =  all-gather      ({Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä,Ì†µÌ≤ã)    Ì†µÌ±ÅFSDP‚àí1  )                                               (53)
+
+                                                                                                    }
+
+                                                                                                    Ì†µÌ±ó=0
+
+                                                       Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)   =  all-gather      ({Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä,Ì†µÌ≤ã)    Ì†µÌ±ÅFSDP‚àí1  )                                               (54)
+
+                                                                                                    }
+
+                                                                                                    Ì†µÌ±ó=0
+
+                                                       Ì†µÌ≤ô(Ì†µÌøèÌ†µÌ≤ä,Ì†µÌ≤ã) = Ì†µÌ≤ô(Ì†µÌ≤ã)Ì†µÌ±æÌ†µ(ÌøèÌ†µÌ≤ä)                                                                             (55)
+                                                       Ì†µÌ≤ôÌ†µ(ÌøêÌ†µÌ≤ä,Ì†µÌ≤ã) = Ì†µÌ≤ô(Ì†µÌ≤ã)Ì†µÌ±æÌ†µ(ÌøêÌ†µÌ≤ä)                                                                             (56)
+
+                                                                                     45
+                                    Ì†µÌ≤õ(Ì†µÌ≤ä,Ì†µÌ≤ã) = Ì†µÌ±ì (Ì†µÌ≤ô(Ì†µÌøèÌ†µÌ≤ä,Ì†µÌ≤ã)) ‚àó Ì†µÌ≤ôÌ†µ(ÌøêÌ†µÌ≤ä,Ì†µÌ≤ã)                                                  (57)
+
+                                    Ì†µÌ≤ö(Ì†µÌ≤ä,Ì†µÌ≤ã) = Ì†µÌ≤õ(Ì†µÌ≤ä,Ì†µÌ≤ã)Ì†µÌ±æÌ†µ(ÌøëÌ†µÌ≤ä)                                                               (58)
+                                     Ì†µÌ≤ö(Ì†µÌ≤ã) = all-reduce ({Ì†µÌ≤ö(Ì†µÌ≤ä,Ì†µÌ≤ã)}Ì†µÌ±ÅTP‚àí1),                                                   (59)
+
+                                                                                       Ì†µÌ±ñ=0
+
+ending  up  with  batch-sharded  output  Ì†µÌ≤ö(Ì†µÌ≤ã)  of  size  (    Ì†µÌ∞µ    ,  Ì†µÌ∞∑).   We‚Äôll  omit  the  backward  pass  for  brevity  in
+                                                              Ì†µÌ±ÅFSDP
+
+this section, and just focus on the forward pass. But at this point, you should have all the information
+
+you need to write it out yourself.
+
+Problem (fsdp_tp_calcs): 2D parallelism calculations (6 points)
+
+Under the same setting as the calculations so far, let‚Äôs calculate when 2D parallelism becomes
+bottlenecked.
+
+(a) How many FLOPs are required to compute the forward pass, with Ì†µÌ±ÅFSDP FSDP + Ì†µÌ±ÅTP TP?
+
+     Deliverable: An answer in terms of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ±ÅFSDP, and Ì†µÌ±ÅTP, along with a one-sentence
+     justification.
+
+(b) How much communication time is required in the forward pass, with Ì†µÌ±ÅFSDP FSDP + Ì†µÌ±ÅTP
+     TP? Assume that the communication along each axis can be overlapped (in other words, the
+     collectives along the FSDP axis can be overlapped with the collectives along the TP axis).
+
+     Deliverable: An answer in terms of a subset of Ì†µÌ∞µ, Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ±ÅFSDP, Ì†µÌ±ÅTP, and Ì†µÌ±ä , along with a
+     one-sentence justification. Hint: The answer should be expressed as a max between two
+     quantities (the FSDP and TP collective costs), since the two can be overlapped.
+
+(c) Under the optimal setting of Ì†µÌ±ÅTP and Ì†µÌ±ÅFSDP, how large can Ì†µÌ±Å = Ì†µÌ±ÅTPÌ†µÌ±ÅFSDP become before
+     the forward pass is communication bottlenecked?
+
+     Deliverable: An inequality with Ì†µÌ±Å on one side, and an expression in terms of a subset of Ì†µÌ∞µ,
+     Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ∞∂, and Ì†µÌ±ä on the other, along with a few sentences and equations as justification.
+(d) Now suppose the FSDP-axis and TP-axis collectives cannot be overlapped because they share
+     the same network resources. Under the optimal setting of Ì†µÌ±ÅTP and Ì†µÌ±ÅFSDP, how large can Ì†µÌ±Å =
+     Ì†µÌ±ÅTPÌ†µÌ±ÅFSDP become before the forward pass is communication bottlenecked? Don‚Äôt worry
+     about truncating Ì†µÌ±ÅTP and Ì†µÌ±ÅFSDP to be integers.
+
+     Deliverable: An inequality with Ì†µÌ±Å on one side, and an expression in terms of a subset of Ì†µÌ∞µ,
+     Ì†µÌ∞∑, Ì†µÌ∞∑FF, Ì†µÌ∞∂, and Ì†µÌ±ä on the other, along with a few sentences and equations as justification.
+
+9 Leaderboard
+
+Assignment 2‚Ä≤s leaderboard will test the speed of a full training step for an 8B model. We challenge you
+to benchmark your code and to optimize memory and runtime, using any tricks you can come up with.
+The key restrictions are that you cannot change the input/output behavior of the model. Your
+implementation will be tested against the model in the cs336_basics directory. Your inputs will be tested
+at BF16 with causal masking, and they must pass the same tests as your regular implementation. The
+implementation must also be your own, and you cannot use or copy pre-existing implementations. Your
+timing should be measured on two B200 GPUs using a sample with batch size 2 and sequence length
+32,768. It is intentionally difficult to fit the model in memory. See the code below for the full config. We
+
+                                                              46
+will verify the top 5-10 submissions for correctness and performance. The test we will run to time your
+implementation is the following:
+
+   class Config:
+          ctx_len = 32768
+          vocab_size = 151936
+          d_model = 4096
+          d_ff = 11008
+          num_layers = 34
+          num_heads = 32
+          torch_dtype = torch.bfloat16
+          is_causal = True
+          batch_size = 2
+
+   cfg = Config()
+
+   def test_timing_forward_backward():
+          labels, targets = torch.randint(high=cfg.vocab_size, size=(2, cfg.batch_size,
+
+   cfg.ctx_len))
+
+          model = BasicsTransformerLM(Config())
+          optimizer = AdamW(model.parameters())
+
+          def train_step():
+                 optimizer.zero_grad(set_to_none=True)
+                 res = model(labels)
+                 loss = cross_entropy(res, targets).sum()
+                 loss.backward()
+                 optimizer.step()
+
+          timing_results = triton.testing.do_bench(train_step, rep=30_000, warmup=10_000)
+          print(timing_results)
+
+For testing purposes, you can reduce the repetition and warmup time (given in ms) to something shorter.
+
+Some ideas for improvement and for making sure your model fits:
+
+‚Ä¢ Tune the tile sizes for your kernel (use Triton autotune for this!)
+‚Ä¢ Tune additional Triton/torch.compile config parameters
+‚Ä¢ Implement fused AdamW
+‚Ä¢ The base implementation is materializing the full logits ([batch, seq_len, vocab_size]). Write a
+
+   kernel that fuses the LM head and your cross-entropy loss. You can also have it compute the backward
+   pass immediately in a fused manner
+‚Ä¢ Improve FlashAttention
+   ‚Ä£ Implement the backward pass in Triton, not just torch.compile (see Section 4.2.3)
+   ‚Ä£ Do two passes over your input for the backward pass, one for dQ and another for dK and dV, to
+
+      avoid atomics or synchronization between blocks
+   ‚Ä£ Stop program instances early when doing causal masking, skipping tiles that are guaranteed to be all
+
+      zero
+   ‚Ä£ Separate the non-masked tiles from the tile diagonals, computing the first without ever comparing
+
+      indices, and the second with a single comparison
+
+                                                                     47
+   ‚Ä£ Use TMA (Tensor Memory Accelerator) functionality on architectures later than Hopper, following a
+      similar pattern to our tutorial
+
+‚Ä¢ Use activation checkpointing to trade runtime speed for memory savings only if you need it
+
+  Problem (leaderboard): Leaderboard: fastest training step (10 points)
+
+     The benchmark will be run at batch size 2 on two B200 GPUs. Your submission will be evaluated
+     on wall-clock time for a complete training step: forward pass, loss, backward pass, and AdamW
+     update.
+     From an empty PyTorch/Triton cache, your benchmarking run must complete within 10 minutes,
+     so be careful with overly aggressive torch.compile and Triton autotuning.
+     Deliverable: Your best wall-clock time for a full forward-and-backward training step with
+     AdamW.
+     We expect leaderboard submissions to beat the na√Øve baseline of 10 seconds.
+     Submit your result to the leaderboard here:
+
+      github.com/stanford-cs336/assignment2-systems-leaderboard
+
+Bibliography
+
+[1] T. Dao, ‚ÄúFlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning.‚Äù [Online].
+     Available: https://arxiv.org/abs/2307.08691
+
+[2] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, and C. Re, ‚ÄúFlashAttention: Fast and Memory-Efficient Exact
+     Attention with IO-Awareness,‚Äù in Advances in Neural Information Processing Systems, A. H. Oh, A.
+     Agarwal, D. Belgrave, and K. Cho, Eds., 2022. [Online]. Available:
+     https://openreview.net/forum?id=H4DqfPSibmx
+
+[3] M. Milakov and N. Gimelshein, ‚ÄúOnline normalizer calculation for softmax.‚Äù [Online]. Available:
+     https://arxiv.org/abs/1805.02867
+
+[4] H. He, ‚ÄúMaking Deep Learning Go Brrrr From First Principles,‚Äù 2022, [Online]. Available:
+     https://horace.io/brrr_intro.html
+
+[5] S. Rajbhandari, J. Rasley, O. Ruwase, and Y. He, ‚ÄúZeRO: Memory Optimizations Toward Training
+     Trillion Parameter Models.‚Äù 2020.
+
+[6] J. Austin et al., ‚ÄúHow to Scale Your Model,‚Äù 2025.
+[7] H. Z. P. N. M. M. L. W. T. W. Nouamane Tazi Ferdinand Mom, ‚ÄúThe Ultra-Scale Playbook:
+
+     Training LLMs on GPU Clusters.‚Äù 2025.
+
+                                                                     48
+

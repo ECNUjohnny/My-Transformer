@@ -1,0 +1,446 @@
+% ==================== 原文第 27 页 ====================
+% （接上一节 Dr. GRPO 梯度估计量之后的说明）
+其中 $Z$ 通常设为训练批量大小乘以最大生成长度（即 $Z = BGL$，其中 $L$ 为最大生成长度（在我们的设置中是 512））。
+
+\medskip
+\noindent\textbf{问题（\tm{think\_about\_length\_normalization}）：思考长度归一化（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+在做任何实验之前，请思考下面两种做法的区别：按每条序列的长度对每条序列做归一化，与用同一个常数对所有序列做归一化。两种方法各有什么优缺点？是否存在某些特定设置或例子，使得其中一种方法看起来更好？
+
+\textbf{交付要求：}几句话的讨论。
+
+\medskip
+\noindent\textbf{问题（\tm{compute\_group\_normalized\_rewards\_drgrpo}）：Dr.\ GRPO 组归一化（0.5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的方法 \tm{compute\_group\_normalized\_rewards}，使其支持 \tm{advantage\_normalizer = "none"}。虽然 Dr.\ GRPO 使用 \tm{baseline = "mean"}，但在本题中，请同时添加对 \tm{baseline = "none"} 的支持。
+
+要测试你的代码，请实现 \tm{adapters.run\_compute\_group\_normalized\_rewards}。然后用 \tm{uv run pytest -k compute\_group\_normalized\_rewards\_drgrpo} 运行测试，确保你的实现通过测试。
+
+\medskip
+\noindent\textbf{问题（\tm{aggregate\_loss\_across\_microbatch\_constant}）：Dr.\ GRPO 损失聚合（0.5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的方法 \tm{aggregate\_loss\_across\_microbatch}，使其支持 \tm{loss\_normalization = "constant"}。
+
+要测试你的代码，请实现 \tm{adapters.run\_aggregate\_loss\_across\_microbatch}。然后运行 \tm{uv run pytest -k test\_aggregate\_loss\_across\_microbatch\_constant}，确保测试通过。
+
+\subsection{拒绝微调}
+
+我们要研究的下一个消融是一个简单得多的算法，通常称为"拒绝微调"（rejection fine tuning，RFT）或"专家迭代"（expert iteration，EI）。顾名思义，该算法的做法是：采样一大批 rollout，保留其中正确的那些，然后在这些正确的 rollout 上做监督微调（即最小化下一个词预测的对数损失）。具体而言，我们的 RFT 梯度为
+\begin{equation}
+\hat{g} \leftarrow \nabla_\theta\!\left[\frac{1}{Z}\sum_{i=1}^{B}\sum_{j=1}^{G}
+\mathbf{1}\{r\!\left(y^{(i,j)} \mid x^{(i)}\right) = 1\}
+\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)}
+\log \pi_\theta\!\left(y_t^{(i,j)} \mid x^{(i)}, y^{(i,j)}_{<t}\right)\right],
+\end{equation}
+其中 $Z$ 是一个常数归一化因子（与 Dr.\ GRPO 中一样），$\mathbf{1}\{r(y^{(i,j)} \mid x^{(i)}) = 1\}$ 是一个指示函数，只保留正确的回答。在下面的问题中，我们会思考 RFT 梯度是否真的是策略梯度（即它是否真的在优化期望奖励 $J_\theta$），以及它与 GRPO 的关系。与之前一样，在把它实现为 PyTorch 损失时，请返回该目标的相反数，使得最小化该损失等价于对这个估计量做梯度上升。
+
+% ==================== 原文第 28 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{think\_about\_rft}）：思考 RFT（2 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+回忆一下，RFT 目标（采用常数归一化）为
+\begin{equation}
+J_\theta = \frac{1}{Z}\sum_{x}\sum_{j=1}^{G}\mathbf{1}\{r(y^{(j)} \mid x) = 1\}\log \pi_\theta\!\left(y^{(j)} \mid x\right),
+\end{equation}
+其中 $x$ 是提示，每个 $y^{(j)}$ 表示一条回答 $y^{(j)} \overset{\text{iid}}{\sim} \pi_\theta(\cdot \mid x)$，$G$ 是我们从策略中采样的生成数量，$Z$ 是我们的常数归一化因子，$r$ 是奖励函数。于是 RFT 梯度由 $\nabla_\theta J_\theta$ 给出。
+
+作为对比，在策略（on-policy）的 Dr.\ GRPO 策略梯度估计量（即采用常数归一化、且不做标准差归一化的 GRPO）为
+\begin{equation}
+\frac{1}{Z}\sum_{x}\sum_{j=1}^{G}\left(r(y^{(j)} \mid x) - \mu\right)\nabla_\theta \log \pi_\theta\!\left(y^{(j)} \mid x\right),
+\end{equation}
+其中 $\mu$ 表示组均值 $\mu = \frac{1}{G}\sum_{j=1}^{G} r(y^{(j)} \mid x)$。假设我们的奖励函数 $r$ 是二值的，请比较并对照这两个目标。它们有相同的期望吗？你预期哪一个方差更低？直观上，是否存在某些情形让你更倾向于其中某一个？
+
+\textbf{交付要求：}几句话的讨论。
+
+\subsection{MaxRL}
+
+最后，我们将研究一种名为最大似然强化学习（Maximum Likelihood Reinforcement Learning）的新方法，也称为 MaxRL [F.\ Tajwar et al., 2026]。GRPO 选择用组内标准差归一化优势，Dr.\ GRPO 选择什么都不除，而 MaxRL 则提出除以组均值。这一选择带来如下梯度估计量：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{Z}\sum_{i=1}^{B}\sum_{j=1}^{G}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)}
+\frac{r\!\left(y^{(i,j)} \mid x^{(i)}\right) - \mu_i}{\mu_i}
+\nabla_\theta \log \pi_\theta\!\left(y_t^{(i,j)} \mid x^{(i)}, y^{(i,j)}_{<t}\right).
+\end{equation}
+
+注意，在原始的 MaxRL 论文中，他们不是除以常数归一化因子 $Z$，而是除以批次中的 token 总数 $\sum_{i=1}^{B}\sum_{j=1}^{G}\operatorname{len}\!\left(y^{(i,j)}\right)$（这不再是常数，而是依赖于批次）。在本作业中，我们改用常数归一化因子，这样相对于其他基线引入的可变因素更少，更容易分离出"用 $\mu_i$ 代替 $\operatorname{std}_i$ 做归一化"所带来的影响。
+
+在下面的问题中，我们会用一些基础数学来探究不同优势归一化方式的影响。直观地说，除以平均奖励 $\mu_i$ 平均而言会给更难的提示赋更大的权重——与简单提示相比，这些提示的 $\mu_i$ 往往更低。我们可以通过定义期望奖励的一个重加权版本来把这一直觉形式化：
+\begin{equation}
+J_{\theta, w} = \mathbb{E}_{x\sim\rho}\!\left[w\!\left(x, \operatorname{stopgrad}(\pi_\theta)\right)\mathbb{E}_{y\sim\pi_\theta}\, r(y \mid x)\right],
+\end{equation}
+其中 $w(x, \operatorname{stopgrad}(\pi_\theta))$ 对提示 $x$ 重新加权，例如基于当前策略在 $x$ 上的期望奖励所刻画的难度 $\eta(x) = \mathbb{E}_{y\sim\pi_\theta}\, r(y \mid x)$，而 \tm{stopgrad} 表示我们不通过该重加权函数计算梯度。在下面的问题中，我们将为目前见过的每种优势归一化方式推导出对应的难度重加权。
+
+% ==================== 原文第 29 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{derive\_difficulty\_reweightings}）：推导不同优势归一化方式所诱导的难度重加权（6 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+回忆一下，在对提示聚合之后，标准策略梯度为
+\begin{equation}
+\nabla_\theta J_\theta = \nabla_\theta \mathbb{E}_{x\sim\rho}\!\left[\mathbb{E}_{y\sim\pi_\theta}\, r(y \mid x)\right],
+\end{equation}
+其中 $\rho$ 是提示 $x$ 上的提示分布，$\pi_\theta$ 表示我们的策略，$r(y \mid x)$ 表示 $y$ 是否是 $x$ 的正确回答。在本题中，我们将推导各个 GRPO 变体所优化的代理目标（surrogate objective），这些代理目标具有如下形式：
+\begin{equation}
+\nabla_\theta J_{\theta,w} = \nabla_\theta \mathbb{E}_{x\sim\rho}\!\left[w\!\left(x, \operatorname{stopgrad}(\pi_\theta)\right)\mathbb{E}_{y\sim\pi_\theta}\, r(y \mid x)\right]
+\end{equation}
+其中 $w$ 是对提示的某种重加权（我们不通过 $w$ 求导）。
+
+\begin{enumerate}[label=(\alph*)]
+  \item 回忆一下，Dr.\ GRPO 策略梯度估计量为
+  \begin{equation}
+  \mathbb{E}_{x\sim\rho}\!\left[\frac{1}{Z}\sum_{j=1}^{G}\left(r(y^{(j)} \mid x) - \mu\right)\nabla_\theta \log \pi_\theta\!\left(y^{(j)} \mid x\right)\right]
+  \end{equation}
+  其中 $\mu$ 表示组均值 $\mu = \frac{1}{G}\sum_{j=1}^{G} r(y^{(j)} \mid x)$。取常数归一化因子 $Z = G$ 并令组大小 $G \to \infty$，该估计量等价于优化哪个重加权函数 $w$ 对应的代理目标 $J_{\theta,w}$？
+
+  \textbf{交付要求：}一个由问题参数的某个子集表示的表达式，并附上几句论证。
+
+  \item 在采用常数归一化的前提下，GRPO 估计量与 Dr.\ GRPO 的不同之处在于它还要除以标准差：
+  \begin{equation}
+  \mathbb{E}_{x\sim\rho}\!\left[\frac{1}{Z}\sum_{j=1}^{G}\frac{r(y^{(j)} \mid x) - \mu}{\operatorname{std}}\nabla_\theta \log \pi_\theta\!\left(y^{(j)} \mid x\right)\right],
+  \end{equation}
+  其中 $\operatorname{std}$ 表示组标准差。取常数归一化因子 $Z = G$ 并令组大小 $G \to \infty$，该估计量等价于优化哪个重加权函数 $w$ 对应的代理目标 $J_{\theta,w}$？
+
+  \textbf{交付要求：}一个由问题参数的某个子集表示的表达式，并附上几句论证。
+
+  \item MaxRL 则改为除以组均值，即
+  \begin{equation}
+  \mathbb{E}_{x\sim\rho}\!\left[\frac{1}{Z}\sum_{j=1}^{G}\frac{r(y^{(j)} \mid x) - \mu}{\mu}\nabla_\theta \log \pi_\theta\!\left(y^{(j)} \mid x\right)\right].
+  \end{equation}
+  取常数归一化因子 $Z = G$ 并令组大小 $G \to \infty$，该估计量等价于优化哪个重加权函数 $w$ 对应的代理目标 $J_{\theta,w}$？
+
+  \textbf{交付要求：}一个由问题参数的某个子集表示的表达式，并附上几句论证。
+\end{enumerate}
+
+% ==================== 原文第 30 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{think\_about\_advantage\_normalization}）：思考优势归一化（2 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+在做任何实验之前，请思考下面几种做法的区别：用组标准差对组内优势做归一化、用组均值做归一化，或者完全不做优势归一化。各种方法各有什么优缺点？是否存在某些特定设置或例子，使得其中一种方法看起来更好？
+
+\textbf{交付要求：}几句话的讨论。
+
+\medskip
+\noindent\textbf{问题（\tm{compute\_group\_normalized\_rewards\_maxrl}）：MaxRL 组归一化（0.5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的方法 \tm{compute\_group\_normalized\_rewards}，使其支持 \tm{advantage\_normalizer = "mean"}。与 \tm{advantage\_normalizer = "std"} 一样，你应当在归一化分母上加上 \tm{advantage\_eps}，以避免除以零。
+
+要测试你的代码，请实现 \tm{adapters.run\_compute\_group\_normalized\_rewards}。然后用 \tm{uv run pytest -k compute\_group\_normalized\_rewards\_maxrl} 运行测试，确保你的实现通过测试。
+
+\subsection{实验}
+
+现在我们准备好做实验来探究这些不同的策略梯度估计量了。首先，我们需要更新 \tm{grpo\_train\_step} 方法以支持这些变体，它们的各个组件我们已在上面实现。具体设置如下：
+\begin{itemize}
+  \item \tm{GRPO\_constant}：\tm{baseline = "mean"}、\tm{advantage\_normalizer = "std"}、\tm{loss\_normalization = "constant"}
+  \item \tm{Dr\_GRPO}：\tm{baseline = "mean"}、\tm{advantage\_normalizer = "none"}、\tm{loss\_normalization = "constant"}
+  \item \tm{RFT}：\tm{baseline = "none"}、\tm{advantage\_normalizer = "none"}、\tm{loss\_normalization = "constant"}
+  \item \tm{MaxRL}（采用常数归一化）：\tm{baseline = "mean"}、\tm{advantage\_normalizer = "mean"}、\tm{loss\_normalization = "constant"}
+\end{itemize}
+
+为了加速训练，请注意：一旦算出了每条序列的归一化优势，优势为零的序列就无需再传入模型，因为它们对梯度的贡献是零。由于我们的奖励是二值的，序列的优势为零的情况有两种：
+\begin{itemize}
+  \item 若 \tm{baseline = "mean"}，当一组内所有序列的奖励都相同时，这些序列的优势为零。
+  \item 若 \tm{baseline = "none"}，任何奖励为零的序列优势都为零。
+\end{itemize}
+
+在剪枝掉零优势序列之后，我们还可以按相同的比例减少 \tm{gradient\_accumulation\_steps}（即保持 \tm{microbatch\_size} 不变）；例如，如果一半的序列优势为零，我们可以做 $k/2$ 次梯度累积步而不是 $k$ 次。这个优化对 RFT 尤其有帮助，因为 RFT 会有相当多奖励为零的序列。但你要在数学和实现上都小心，确保剪枝后的版本计算出的梯度与未剪枝版本相同。
+
+% ==================== 原文第 31 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{grpo\_train\_step\_variants\_on\_policy}）：GRPO 训练步变体（2.5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的 \tm{grpo\_train\_step} 方法，使其支持全部在策略变体（仍然保持 \tm{importance\_reweighting\_method = "none"}）。这些选项包括 \tm{baseline: Literal["mean", "none"]}、\tm{advantage\_normalizer: Literal["std", "none", "mean"]} 和 \tm{loss\_normalization: Literal["sequence", "constant"]}。此外，为了加速训练，你的方法应避免把零优势序列传入模型。
+
+注意，对于 \tm{baseline = "none"}，不正确的样本得到的奖励为零，因此在损失中的权重也为零，所以没有必要把它们传入模型。你可以利用这一点来调整实现并加速训练。
+
+要测试你的代码，请实现 \tm{adapters.run\_grpo\_train\_step}。然后运行 \tm{uv run pytest -k test\_grpo\_train\_step\_variants\_on\_policy}，确认测试通过。
+
+训练步实现完毕之后，我们就可以做实验来观察各方法的表现，并判断它们是否优于标准 GRPO。你应当使用与之前运行相同的超参数，以保证各次运行之间可以相互比较。
+
+\medskip
+\noindent\textbf{关于调超参数的说明：}如果我们的目标是判断某个方法是否优于另一个方法，那么在实验上最稳妥的做法是为每个方法分别调超参数。然而，超参数调优非常昂贵，而本作业没有那么多算力。另一种更省钱的选项是：为基线调好超参数，然后把这套超参数用于新方法（例如在我们的情形中，我们在标准 GRPO 上调好了学习率，并在下面的实验中使用这个学习率）。在这种做法下，如果新方法优于基线，我们仍然可以断言它更好，因为次优的学习率给出的是新方法在正确调参后性能的下界；但反过来，如果新方法表现更差，我们不能断言它比基线差，因为我们并没有为它正确地调超参数。
+
+\medskip
+\noindent\textbf{问题（\tm{grpo\_experiments\_variants\_on\_policy}）：比较不同 RL 算法的性能（8 B200 小时）（10 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+在保持超参数与你的标准 GRPO 训练运行一致的前提下（就你选择的学习率而言），运行以下变体，每种变体使用 4 个随机种子。你应当使用零样本（zero-shot）的 \tm{r1\_zero} 提示词。
+\begin{itemize}
+  \item \tm{GRPO\_constant}：标准 GRPO，但损失聚合采用常数归一化，而不是序列归一化。
+  \item \tm{Dr\_GRPO}：\tm{GRPO\_constant} 但 \tm{advantage\_normalizer = "none"}。
+  \item \tm{RFT}：\tm{GRPO\_constant} 但 \tm{advantage\_normalizer = "none"} 且 \tm{baseline = "none"}。注意，对这个方法来说，无需把不正确的样本传入被训练的模型，这应当能加快训练。
+  \item \tm{MaxRL}：\tm{GRPO\_constant} 但 \tm{advantage\_normalizer = "mean"}。注意，原始 MaxRL 实现按每个微批次的 token 数对损失做归一化，而我们改用常数归一化。
+\end{itemize}
+
+与你之前运行的标准 GRPO 相比，这些方法表现如何？哪些方法的平均性能最好，哪些方法的方差最低？你认为哪些方法会从更多的超参数调优中受益？基于各次运行之间的方差，你对自己的结论有多大把握？
+
+% ==================== 原文第 32 页 ====================
+\textbf{交付要求：}点评文字，并为所引用的指标配图。
+
+\section{离策略 RL}
+
+到目前为止，我们的实验和算法都是完全在策略（fully on-policy）的，也就是说，每个梯度估计量使用的都是直接从被更新的模型中采出的样本（即每个推理批次只做 1 次训练步，且训练批量大小等于推理批量大小）。在本节中，我们将研究离策略 RL（off-policy RL）：它在每个推理批次上做多次训练步，有望加速训练，但代价是潜在的不稳定性与更高的算法复杂度。
+
+\subsection{重要性重加权}
+
+在最朴素的策略梯度版本中，我们采样一批回答，然后在这批回答上做一次大批量的梯度步。但我们可以期待：如果把这一批切成一系列小批量（minibatch），并在每个小批量上做一次训练步，模型也许能训练得更快。这种做法称为"离策略 RL"，与我们最初"每个推理批次做一次训练步"的"在策略 RL"形成对比。
+
+这种做法被称为离策略 RL 的原因在于：做完第一个小批量步之后，当前策略就不再等于推理时所用的策略了。此时样本是"离策略"（off-policy）或"过期"（stale）的；它们并非来自我们想为之计算策略梯度的当前策略。用记号表示，如果把推理策略记为 $\pi_0$、当前策略记为 $\pi_\theta$，则有
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[r(y \mid x)\nabla_\theta \log \pi_\theta(y \mid x)\right] \neq \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}\!\left[r(y \mid x)\nabla_\theta \log \pi_\theta(y \mid x)\right].
+\end{equation}
+左边是我们的"朴素"（naive）离策略估计量：我们假装回答 $y$ 来自当前策略，并机械地套用同样的步骤来计算策略梯度。这个式子说明，这个朴素估计量的期望是不正确的。
+
+纠正这一偏差的一种方法是使用重要性重加权（importance reweighting），它给出如下估计量：
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[\frac{\pi_\theta(y \mid x)}{\pi_0(y \mid x)}\, r(y \mid x)\,\nabla_\theta \log \pi_\theta(y \mid x)\right],
+\end{equation}
+其中我们应用了重要性权重 $\frac{\pi_\theta(y \mid x)}{\pi_0(y \mid x)}$。这些权重的效果是：上调那些对当前策略 $\pi_\theta$ 仍然相关的 $y$ 的权重，同时下调 $\pi_\theta(y \mid x)$ 较低的"过期"样本的权重。不难看出，修改后的表达式具有正确的期望：
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[\frac{\pi_\theta(y \mid x)}{\pi_0(y \mid x)}\, r(y \mid x)\,\nabla_\theta \log \pi_\theta(y \mid x)\right] = \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}\!\left[r(y \mid x)\nabla_\theta \log \pi_\theta(y \mid x)\right].
+\end{equation}
+
+缺点是重要性重加权会增大估计量的方差：如果重要性权重 $\frac{\pi_\theta(y \mid x)}{\pi_0(y \mid x)}$ 可以大到 $C$，我们的方差也可能放大 $C$ 倍。这个问题使得朴素的重要性重加权无法直接用于语言模型——语言模型的重要性权重是 $\operatorname{len}(y)$ 个因子的乘积，随回答长度呈指数增长：
+\begin{equation}
+\frac{\pi_\theta(y \mid x)}{\pi_0(y \mid x)} = \prod_{t=1}^{\operatorname{len}(y)} \frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}.
+\end{equation}
+所以，与"朴素"的无加权离策略估计量（偏差大，但没有重加权引入的额外方差）相比，这个重加权估计量零偏差但方差大。下面介绍的方法将介于两者之间，提出各种启发式方法来处理这一偏差—方差权衡。
+
+% ==================== 原文第 33 页 ====================
+\subsection{PPO/GRPO 风格的重要性重加权与裁剪}
+
+\subsubsection{token 级重加权}
+
+标准做法最早由 PPO [J.\ Schulman et al., 2017] 提出，也被 GRPO [Z.\ Shao et al., 2024] 采用：做 token 级的重要性重加权，而不是序列级重加权。这一选择带来如下"无裁剪 token 级重加权"估计量：
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[r(y \mid x)\sum_{t=1}^{\operatorname{len}(y)} \frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}\,\nabla_\theta \log \pi_\theta(y_t \mid x, y_{<t})\right].
+\end{equation}
+
+注意，这个表达式与我们上面看到的"有原则的"序列级估计量并不相同，后者可以改写为（按时间步展开）：
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[r(y \mid x)\left(\prod_{t=1}^{\operatorname{len}(y)} \frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}\right)\sum_{t=1}^{\operatorname{len}(y)} \nabla_\theta \log \pi_\theta(y_t \mid x, y_{<t})\right].
+\end{equation}
+
+在深入分析这个修改后的表达式在做什么之前，先注意一点：重加权项不再是关于 $\operatorname{len}(y)$ 指数级的，这会大幅降低方差。
+
+与作业前面的各节一样，为了更好地理解这个估计量，我们要推导它所优化的代理目标 [T.\ Degris et al., 2013]。具体而言，令 $\tilde{\pi}_t$ 表示这样一个代理策略：除第 $t$ 步从 $\pi_\theta$ 采样之外，所有其他时间步都从旧策略 $\pi_0$ 采样：
+\begin{equation}
+\tilde{\pi}_t(y \mid x) = \left(\prod_{s=1}^{t-1} \pi_0(y_s \mid x, y_{<s})\right)\pi_\theta(y_t \mid x, y_{<t})\left(\prod_{s=t+1}^{\operatorname{len}(y)} \pi_0(y_s \mid x, y_{<s})\right).
+\end{equation}
+
+那么，如果我们假设所有回答的长度都相同、均为 $L$，可以证明 token 级重加权优化的正是每个 $\tilde{\pi}_t$ 下的期望奖励，即
+\begin{equation}
+J_\theta^{\text{token}} = \mathbb{E}_{x}\!\left[\sum_{t=1}^{L}\mathbb{E}_{y\sim\tilde{\pi}_t(y \mid x)}\!\left[r(y \mid x)\right]\right].
+\end{equation}
+
+这一事实可以直接通过用重要性重加权项改写该代理目标得到：
+\begin{align}
+\nabla_\theta J_\theta^{\text{token}} &= \nabla_\theta \mathbb{E}_{x}\!\left[\sum_{t=1}^{L}\mathbb{E}_{y\sim\tilde{\pi}_t(y \mid x)}\!\left[r(y \mid x)\right]\right] \nonumber\\
+&= \nabla_\theta \mathbb{E}_{x}\!\left[\sum_{t=1}^{L}\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[\frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}\, r(y \mid x)\right]\right] \nonumber\\
+&= \mathbb{E}_{x}\!\left[\mathbb{E}_{y\sim\pi_0(y \mid x)}\!\left[\sum_{t=1}^{L}\frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}\, r(y \mid x)\,\nabla_\theta \log \pi_\theta(y_t \mid x, y_{<t})\right]\right],
+\end{align}
+其中最后一步用到了我们在本作业中反复使用的对数导数技巧（log derivative trick）。
+
+这个代理目标直观地展示了 token 级重加权引入的偏差。第一，对第 $t$ 项来说，前缀 $y_{<t}$ 是从 $\pi_0$ 而不是从 $\pi_\theta$ 采出的，因此它可能无法代表来自当前模型的前缀。第二，当我们从当前策略 $\pi_\theta$ 采样出 token $y_t$ 之后，后缀 $y_{>t}$ 却是从 $\pi_0$ 而不是从 $\pi_\theta$ 采出的。换句话说，当该目标评估动作 $y_t$ 会如何影响后续步骤时，它依据的是过期策略 $\pi_0$ 而非当前策略 $\pi_\theta$ 的行为。这两种偏差都会被序列级重加权纠正，因为后者会正确地对前缀和后缀重新加权（代价是方差增大）。直观地说，$\pi_\theta$ 离 $\pi_0$ 越远，这些偏差就越严重。
+
+% ==================== 原文第 34 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{derive\_surrogate\_objectives}）：推导重要性重加权方法所优化的代理目标（2 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+在上面我们看到，token 级重要性重加权优化的是这样一组代理策略下的期望奖励：除一个位置外，其余位置都从旧策略采样。假设我们转而考虑一种"成对"（pairwise）的重要性重加权方法，其策略梯度估计量为
+\begin{equation}
+\sum_{t=1}^{L/2} \frac{\pi_\theta(y_{2t-1} \mid x, y_{<2t-1})\,\pi_\theta(y_{2t} \mid x, y_{<2t})}{\pi_0(y_{2t-1} \mid x, y_{<2t-1})\,\pi_0(y_{2t} \mid x, y_{<2t})}\, r(y \mid x)\,\nabla_\theta\!\left[\log\!\left(\pi_\theta(y_{2t-1} \mid x, y_{<2t-1})\,\pi_\theta(y_{2t} \mid x, y_{<2t})\right)\right]
+\end{equation}
+其中 $\pi_\theta$ 是我们的当前策略，$\pi_0$ 是我们的过期采样策略，且 $y \sim \pi_0(y \mid x)$。这个估计量在优化什么代理目标？
+
+\textbf{交付要求：}一个由问题参数的某个子集表示的表达式，并附上推导过程。
+
+\subsubsection{裁剪}
+
+除了 token 级重加权之外，PPO 和 GRPO 引入的另一个启发式方法是重要性权重裁剪（importance weight clipping）。如上所述，$\pi_\theta$ 离 $\pi_0$ 越远，重要性重加权的方差问题就越严重；而我们的代理目标告诉我们，token 级重加权的偏差也会越发严重。因此，为了让离策略 RL 保持稳定，我们需要保证 $\pi_\theta$ 与 $\pi_0$ 足够接近。
+
+确保 $\pi_\theta$ 接近 $\pi_0$ 的最简单办法是减少每个推理批次的训练步数，但有些推理批次本可以支持更多步。为了从算法中榨取性能，我们希望推理批次允许做多少步就做多少步。朝着这个目标，有一类方法会裁剪重要性权重过大或过小的项。
+
+近期的论文在裁剪应当如何实现的细节上意见不一，但在本作业中，我们将实现来自 PPO 的裁剪方法——这一方法延续到了 GRPO，似乎是主流做法。首先，把 token 级重加权与标准 GRPO 目标结合起来，得到如下损失函数：
+\begin{equation}
+J_\theta^{\text{GRPO-off-policy-noclip}} = \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G}\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)} \frac{r\!\left(y^{(i,j)} \mid x^{(i)}\right) - \mu_i}{\operatorname{std}_i}\, \frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})},
+\end{equation}
+其中样本取自我们的过期推理策略 $\pi_0$。你可以验证，对这个目标求微分得到的正是我们上面推导的 token 重加权策略梯度估计量，只不过用的是 GRPO 优势和序列归一化。
+
+我们准备给这个目标加上裁剪了。令 $A^{(i,j)} = \frac{r\left(y^{(i,j)} \mid x^{(i)}\right) - \mu_i}{\operatorname{std}_i}$ 表示提示 $i$ 上回答 $j$ 的优势，令 $w_t^{(i,j)} = \frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}$ 表示第 $t$ 个重要性重加权项，则该目标的裁剪版本为
+\begin{equation}
+J_\theta^{\text{GRPO-off-policy-clip}} = \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G}\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)} \min\!\left(A^{(i,j)}w_t^{(i,j)},\; A^{(i,j)}\operatorname{clip}\!\left(w_t^{(i,j)}, [1-\varepsilon,\, 1+\varepsilon]\right)\right),
+\end{equation}
+
+% ==================== 原文第 35 页 ====================
+其中 $\operatorname{clip}(w, [1-\varepsilon, 1+\varepsilon]) = \min(\max(w, 1-\varepsilon), 1+\varepsilon)$ 把重要性权重裁剪到区间 $[1-\varepsilon, 1+\varepsilon]$ 内。这个目标还有一个稍微更直观的写法 [J.\ Achiam, 2018]：
+\begin{equation}
+J_\theta^{\text{GRPO-off-policy-clip}} = \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G}\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)}
+\begin{cases}
+\min\!\left(w_t^{(i,j)}, 1+\varepsilon\right)A^{(i,j)} & \text{if } A^{(i,j)} \geq 0\\
+\max\!\left(w_t^{(i,j)}, 1-\varepsilon\right)A^{(i,j)} & \text{if } A^{(i,j)} < 0
+\end{cases}.
+\end{equation}
+
+在这个目标下，模型会被激励去上调高优势动作的权重，直到它给该动作的权重超过旧策略 $1+\varepsilon$ 倍为止；在那一刻，$\min$ 会走 $1+\varepsilon$ 那条路，对它求微分得到零梯度。负优势的动作也类似：模型会被激励去下调该动作的权重，直到它给该动作的权重低于旧策略 $1-\varepsilon$ 倍为止，此时该动作的梯度变为零。于是，取梯度后我们得到如下策略梯度估计量：
+\begin{equation}
+\nabla_\theta J_\theta^{\text{GRPO-off-policy-clip}} = \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G}\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)} \operatorname{mask}_t^{(i,j)}\, w_t^{(i,j)}\, A^{(i,j)}\, \nabla_\theta \log \pi_\theta(y_t \mid x, y_{<t})
+\end{equation}
+配套一个掩码函数
+\begin{equation}
+\operatorname{mask}_t^{(i,j)} =
+\begin{cases}
+\mathbf{1}\{w_t^{(i,j)} < 1+\varepsilon\} & \text{if } A^{(i,j)} \geq 0\\
+\mathbf{1}\{w_t^{(i,j)} > 1-\varepsilon\} & \text{if } A^{(i,j)} < 0
+\end{cases}
+\end{equation}
+它对正优势掩掉过大的重要性权重，对负优势掩掉过小的重要性权重。
+
+现在我们有了在损失函数中实现 \tm{importance\_reweighting\_method = "noclip"} 和 \tm{importance\_reweighting\_method = "grpo"} 所需的全部数学，它们分别对应 $J_\theta^{\text{GRPO-off-policy-noclip}}$ 和 $J_\theta^{\text{GRPO-off-policy-clip}}$。与在策略情形一样，请在损失实现中返回目标的相反数，使得梯度下降执行预期的梯度上升更新。
+
+\medskip
+\noindent\textbf{问题（\tm{compute\_policy\_gradient\_loss\_off\_policy}）：带 token 级重加权的离策略策略梯度（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的方法 \tm{compute\_policy\_gradient\_loss}，使其支持 \tm{importance\_reweighting\_method = "noclip"} 或 \tm{"grpo"}，二者会用到 \tm{old\_log\_probs} 和 \tm{cliprange} 参数。\tm{old\_log\_probs} 表示生成 rollout 的模型下每个 token 的对数概率，你需要在训练脚本中添加几行代码来计算它。\tm{cliprange} 表示裁剪强度参数 $\varepsilon$。
+
+要测试你的代码，请实现 \tm{adapters.run\_compute\_policy\_gradient\_loss}。然后运行 \tm{uv run pytest -k test\_compute\_policy\_gradient\_loss\_off\_policy}，确保测试通过。
+
+\textbf{注意：}虽然 PPO 中引入裁剪的动机是防止当前策略偏离旧策略太远，但我们也可以把它看作降低重要性重加权估计量方差的手段，因为我们压扁了过大的重要性权重项。如果我们不那么在意偏离旧策略、想在更新上更激进，那么一个简单得多、也直接得多的控方差办法是：直接在梯度估计量中对重要性权重做上界裁剪：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G}\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)} \min\!\left(w_t^{(i,j)}, 1+\varepsilon\right)A^{(i,j)}\,\nabla_\theta \log \pi_\theta(y_t \mid x, y_{<t}),
+\end{equation}
+与 PPO/GRPO 不同的是，对那些被上调超过 $1+\varepsilon$ 倍的动作，我们仍然保留非零梯度。这个更简单的裁剪流程由 CISPO [MiniMax et al., 2025] 提出（注意：他们还按每组的 token 数而不是每条序列的长度做归一化，但为简单起见，我们这里写出的是序列归一化的目标）。你也可以选择性地上手试一下 CISPO，并把它与其他裁剪方法做比较。
+
+% ==================== 原文第 36 页 ====================
+\subsection{GSPO}
+
+如上所述，token 级重加权是有偏的，因为它忽略了前缀与后缀的重加权。在 GSPO 论文 [C.\ Zheng et al., 2025] 中，作者发现 GRPO 不稳定，并主张应当改做序列级重加权。为了绕开序列级重要性权重是 $L$ 个因子的乘积这一事实，他们干脆把这个表达式取 $\frac{1}{L}$ 次幂。换句话说，他们用整条序列上重要性权重的几何平均（而不是乘积）来做重加权。得到的损失函数如下：
+\begin{equation}
+J_\theta^{\text{GRPO-off-policy-gspo}} = \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G}\min\!\left(A^{(i,j)}s^{(i,j)},\; A^{(i,j)}\operatorname{clip}\!\left(s^{(i,j)}, [1-\varepsilon,\, 1+\varepsilon]\right)\right),
+\end{equation}
+其中 $s^{(i,j)}$ 是一个在所有时间步之间共享的序列级重要性权重：
+\begin{equation}
+s^{(i,j)} = \left(\prod_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)} \frac{\pi_\theta(y_t \mid x, y_{<t})}{\pi_0(y_t \mid x, y_{<t})}\right)^{\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}}.
+\end{equation}
+
+注意，如果不取 $\frac{1}{\operatorname{len}\left(y^{(i,j)}\right)}$ 次幂、也不做裁剪，这个目标就退化为序列级重要性重加权的策略梯度损失。取几何平均与裁剪都以偏差为代价降低了方差。另一点值得一提的是：在求梯度时，几何平均的幂次会自然地给出序列长度归一化（为简洁起见，下面的式子忽略了裁剪）：
+\begin{align}
+\nabla_\theta J_\theta^{\text{GRPO-off-policy-gspo}} &= \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} A^{(i,j)}\,\nabla_\theta s^{(i,j)} \nonumber\\
+&= \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} A^{(i,j)}s^{(i,j)}\,\frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)} \nabla_\theta \log \pi_\theta(y_t \mid x, y_{<t}).
+\end{align}
+
+所以，如果你想把 GSPO 应用到你喜欢的某个常数归一化 RL 算法上（选做），你需要修改序列级重要性权重中的指数。
+
+\medskip
+\noindent\textbf{问题（\tm{think\_about\_importance\_reweighting}）：思考重要性重加权（2 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+考虑离策略 RL 的三种重要性重加权策略：(a) 不做重要性重加权；(b) PPO/GRPO 风格的、带裁剪的 token 级重要性重加权；(c) GSPO 风格的、使用几何平均的、带裁剪的序列级重要性重加权。在偏差与方差的权衡上，各种方法分别位于谱系的哪个位置？你能想到某些情形，使得直觉上某一种方法会比其他方法更好吗？
+
+\textbf{交付要求：}几句话的点评。
+
+% ==================== 原文第 37 页 ====================
+在下面的问题中，我们将实现 GSPO 损失。请记住要以数值稳定的方式计算几何平均。
+
+\medskip
+\noindent\textbf{问题（\tm{compute\_policy\_gradient\_loss\_off\_policy\_gspo}）：带序列级重加权的离策略策略梯度（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的方法 \tm{compute\_policy\_gradient\_loss}，使其支持 \tm{importance\_reweighting\_method = "gspo"}，它会用到 \tm{old\_log\_probs} 和 \tm{cliprange} 参数。\tm{old\_log\_probs} 表示生成 rollout 的模型下每个 token 的对数概率，你需要在训练脚本中添加几行代码来计算它。\tm{cliprange} 表示裁剪强度参数 $\varepsilon$。与上面一样，请返回目标的相反数，使得最小化该损失等价于做梯度上升。
+
+要测试你的代码，请实现 \tm{adapters.run\_compute\_policy\_gradient\_loss}。然后运行 \tm{uv run pytest -k test\_compute\_policy\_gradient\_loss\_off\_policy\_gspo}，确保测试通过。
+
+\subsection{实验}
+
+现在我们拥有了更新 \tm{grpo\_train\_step} 方法以支持离策略训练所需的全部组件。
+
+\medskip
+\noindent\textbf{问题（\tm{grpo\_train\_step\_off\_policy}）：离策略 GRPO 训练步（2.5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}更新你的 \tm{grpo\_train\_step} 方法，使其支持离策略参数（\tm{importance\_reweighting\_method}、\tm{old\_log\_probs}、\tm{cliprange}）。现在该函数应当支持全部范围的参数。
+
+要测试你的代码，请实现 \tm{adapters.run\_grpo\_train\_step}。然后运行 \tm{uv run pytest -k test\_grpo\_train\_step\_off\_policy}，确认测试通过。
+
+把训练改成离策略真的能更快吗？我们会在多大程度上损失稳定性？哪种重加权/裁剪方法最好？我们将在下面的实验中探究这些问题。请保持超参数与你之前的 RL 运行一致，唯一的例外是这些运行现在应当是 32 倍离策略的（即每个推理批次做 32 次训练步）：
+
+\begin{lstlisting}
+rollout_batch_size = 256
+train_batch_size = 8
+gradient_accumulation_steps = 1
+\end{lstlisting}
+
+此外，作为默认值，你可以使用下面这组裁剪范围取值（即上面推导中的 $\varepsilon$），它们取自原始论文。当然，你也欢迎自行调整这些取值。
+\begin{itemize}
+  \item \tm{offpolicy\_clip}：\tm{cliprange = 0.2}
+  \item \tm{offpolicy\_gspo}：\tm{cliprange = 3e-4}
+\end{itemize}
+
+注意，你还需要在训练脚本中添加几行代码来计算 \tm{old\_log\_probs}，以便传入你的重加权损失。
+
+% ==================== 原文第 38 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{grpo\_experiments\_off\_policy}）：比较不同离策略算法的性能（8 B200 小时）（10 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+在保持超参数与你的标准 GRPO 训练运行一致的前提下（就你选择的学习率而言），运行以下变体，每种变体使用 4 个随机种子。你应当使用零样本的 \tm{r1\_zero} 提示词。如果你愿意，也可以从上一小节中挑选你最喜欢的 RL 算法变体来代替标准版本。
+\begin{itemize}
+  \item \tm{offpolicy\_naive}：不再让推理与训练批量大小相等（均为 256），而是把训练批量大小缩减为推理批量大小的 1/32（$\frac{256}{32} = 8$）。记住要按相同的比例减少梯度累积步数，以便我们继续充分利用 GPU。保持 \tm{importance\_reweighting\_method = "none"}。
+  \item \tm{offpolicy\_noclip}：\tm{offpolicy\_naive} 加上 \tm{importance\_reweighting\_method = "noclip"}。
+  \item \tm{offpolicy\_clip}：\tm{offpolicy\_naive} 加上 \tm{importance\_reweighting\_method = "grpo"}。
+  \item \tm{offpolicy\_gspo}：\tm{offpolicy\_naive} 加上 \tm{importance\_reweighting\_method = "gspo"}。
+\end{itemize}
+除了你已经在记录的指标之外，请确保同时记录裁剪比例（clip fraction）。
+
+与你之前运行的完全在策略 GRPO 相比，这些方法表现如何？改为离策略对训练稳定性以及各次运行之间的方差有什么影响？两种裁剪方法在裁剪比例上有何差异，哪一个看起来更稳定？你认为哪些方法会从更多的超参数调优中受益？基于各次运行之间的方差，你对自己的结论有多大把握？
+
+\textbf{交付要求：}点评文字，并为所引用的指标配图。
+
+\section{尝试你自己的策略梯度估计量}
+
+\medskip
+\noindent\textbf{问题（\tm{try\_your\_own}）：尝试你自己的策略梯度估计量（10 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+你已经见过文献中提出的各种各样的策略梯度估计量，以及它们背后的一些理论。现在轮到你自己提出一个了！这里有一些建议：
+\begin{itemize}
+  \item 你可以尝试一个不同的优势估计量，从而诱导出对提示的不同重加权。
+  \item 你可以尝试一种不同的重要性重加权策略。
+  \item 你可以在优势估计量中尝试一个不同的奖励基线。
+\end{itemize}
+
+请提出你自己的策略梯度估计量。然后在相同的 RL 设定（OLMo-2-0425-1B 在 GSM8K 上）下运行它，并与我们已经尝试过的方法作为基线进行比较，使用多个随机种子并保持问题参数固定，以使结果可以相互比较。请相对已有方法只改动一处（也就是说，本作业覆盖的方法中至少要有一个，使得你的方法相对它只改变了一件事）。
+
+你提出的改动背后的理论依据或直觉是什么？你的改动能否击败这些基线？
+
+\textbf{交付要求：}点评文字，并为所引用的指标配图；如有助于论证你的方法，可选地附上数学推导。
+
+% ==================== 原文第 39 页 ====================
+\section*{参考文献（Bibliography）}
+
+\begin{itemize}
+  \item J. Li \textit{et al.}, "DataComp-LM: In search of the next generation of training sets for language models." [Online]. Available: \url{https://arxiv.org/abs/2406.11794}
+  \item T. OLMo \textit{et al.}, "2 OLMo 2 Furious." [Online]. Available: \url{https://arxiv.org/abs/2501.00656}
+  \item K. Cobbe \textit{et al.}, "Training Verifiers to Solve Math Word Problems." [Online]. Available: \url{https://arxiv.org/abs/2110.14168}
+  \item DeepSeek-AI \textit{et al.}, "DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning." [Online]. Available: \url{https://arxiv.org/abs/2501.12948}
+  \item W. Kwon \textit{et al.}, "Efficient Memory Management for Large Language Model Serving with PagedAttention." 2023.
+  \item Z. Liu \textit{et al.}, "Understanding R1-Zero-Like Training: A Critical Perspective." [Online]. Available: \url{https://arxiv.org/abs/2503.20783}
+  \item OpenAI \textit{et al.}, "OpenAI o1 System Card." [Online]. Available: \url{https://arxiv.org/abs/2412.16720}
+  \item Z. Shao \textit{et al.}, "DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models." [Online]. Available: \url{https://arxiv.org/abs/2402.03300}
+  \item J. Achiam, "Spinning Up in Deep Reinforcement Learning," 2018.
+  \item N. Lambert, "Reinforcement Learning from Human Feedback." [Online]. Available: \url{https://rlhfbook.com/}
+  \item R. J. Williams, "Simple statistical gradient-following algorithms for connectionist reinforcement learning," \textit{Machine Learning}, vol. 8, no. 3--4, pp. 229--256, 1992, doi: \url{10.1007/BF00992696}.
+  \item F. Tajwar \textit{et al.}, "Maximum Likelihood Reinforcement Learning." [Online]. Available: \url{https://arxiv.org/abs/2602.02710}
+  \item J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov, "Proximal Policy Optimization Algorithms." [Online]. Available: \url{https://arxiv.org/abs/1707.06347}
+  \item T. Degris, M. White, and R. S. Sutton, "Off-Policy Actor-Critic." [Online]. Available: \url{https://arxiv.org/abs/1205.4839}
+  \item J. Achiam, "Simplified PPO-Clip Objective." [Online]. Available: \url{https://drive.google.com/file/d/1PDzn9RPvaXjJFZkGeapMHbHGiWWW20Ey/view}
+  \item MiniMax \textit{et al.}, "MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention." [Online]. Available: \url{https://arxiv.org/abs/2506.13585}
+  \item C. Zheng \textit{et al.}, "Group Sequence Policy Optimization." [Online]. Available: \url{https://arxiv.org/abs/2507.18071}
+\end{itemize}

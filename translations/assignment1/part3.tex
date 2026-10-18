@@ -1,0 +1,491 @@
+% ============================================================
+% part3.tex —— 对应原 PDF 第 33–47 页（文档结尾）
+% 承接 part2：题目（adamw\_accounting）第 (a) 小问激活值组件列表的其余条目
+% 公式编号沿用原文（\tag{21}–\tag{29}），与 part1/part2 保持一致
+% ============================================================
+
+（接上文，计算激活值内存占用时需考虑的组件列表还包括：）
+\begin{itemize}
+  \item 最后的 RMSNorm（final RMSNorm）
+  \item 输出嵌入（output embedding）
+  \item 在 logits 上计算交叉熵（cross-entropy on logits）
+\end{itemize}
+
+\textbf{交付要求：}分别给出参数、激活值、梯度和优化器状态各自内存占用的代数表达式，以及总内存占用。
+
+\begin{enumerate}
+  \item[(b)] 用 GPT-2 XL 形状的模型实例化你的答案，得到一个只依赖于 \tm{batch\_size} 的表达式。在 80GB 内存限制内，你能使用的最大批量大小是多少？
+
+  \textbf{交付要求：}形如 $a \cdot \tm{batch\_size} + b$ 的表达式（其中 $a$、$b$ 为具体数值），以及一个表示最大批量大小的数字。
+  \item[(c)] 运行一步 AdamW 需要多少 FLOPs？
+
+  \textbf{交付要求：}一个代数表达式，附简要论证。
+  \item[(d)] 模型 FLOPs 利用率（Model FLOPs utilization，MFU）定义为观测吞吐量（每秒处理的 token 数）与硬件理论峰值 FLOP 吞吐量之比（A.~Chowdhery et al.~[16]）。一块 NVIDIA H100 GPU 对 ``float32''（实际上是 TensorFloat-32，而后者本质上其实是 ``bfloat19''）运算的理论峰值为 495 teraFLOP/s。假设你能达到 50\% 的 MFU，在单块 H100 上以批量大小 1024 训练 GPT-2 XL 共 400K 步需要多长时间？参照 J.~Kaplan et al.~[25] 与 J.~Hoffmann et al.~[26]，假定反向传播的 FLOPs 是前向传播的两倍。
+
+  \textbf{交付要求：}训练所需的小时数，附简要论证。
+\end{enumerate}
+
+\subsection{学习率调度（Learning rate scheduling）}
+
+使损失下降最快的学习率取值在训练过程中往往会变化。在训练 Transformer 时，通常的做法是使用学习率\textit{调度}（schedule）：一开始使用较大的学习率，以便在训练初期进行更快的更新，然后随着模型的训练把它缓慢衰减到一个较小的值。\footnote{有时也会使用让学习率重新回升（重启，restarts）的调度，以帮助越过局部极小值。}在本作业中，我们将实现训练 LLaMA（H.~Touvron et al.~[12]）时所使用的余弦退火（cosine annealing）调度。
+
+调度器（scheduler）本质上就是一个函数：它接受当前步数 $t$ 以及其他相关参数（例如初始学习率和最终学习率），并返回第 $t$ 步梯度更新所要使用的学习率。最简单的调度是常数函数：无论 $t$ 取何值，它都返回同一个学习率。
+
+余弦退火学习率调度接受以下参数：(i) 当前迭代步 $t$；(ii) 最大学习率 $\alpha_{\max}$；(iii) 最小（最终）学习率 $\alpha_{\min}$；(iv) 预热（warm-up）迭代次数 $T_w$；(v) 余弦退火的最终迭代步 $T_c$。第 $t$ 次迭代时的学习率定义为：
+
+\textbf{（预热）}若 $t < T_w$，则 $\alpha_t = \frac{t}{T_w}\,\alpha_{\max}$。
+
+\textbf{（余弦退火）}若 $T_w \le t \le T_c$，则 $\alpha_t = \alpha_{\min} + \frac{1}{2}\Bigl(1 + \cos\Bigl(\frac{t - T_w}{T_c - T_w}\,\pi\Bigr)\Bigr)\left(\alpha_{\max} - \alpha_{\min}\right)$。
+
+\textbf{（退火后）}若 $t > T_c$，则 $\alpha_t = \alpha_{\min}$。
+
+\subsubsection*{问题（learning\_rate\_schedule）：实现带预热的余弦学习率调度（1 分）}
+
+编写一个函数，它接受 $t$、$\alpha_{\max}$、$\alpha_{\min}$、$T_w$ 和 $T_c$，并根据上面定义的调度器返回学习率 $\alpha_t$。然后实现 \tm{[adapters.get\_lr\_cosine\_schedule]}，并确保它能通过 \tm{uv run pytest -k test\_get\_lr\_cosine\_schedule}。
+
+\subsection{梯度裁剪（Gradient clipping）}
+
+在训练过程中，我们有时会遇到产生较大梯度的训练样本，这会使训练变得不稳定。为了缓解这一问题，实践中常用的一种技术是梯度裁剪（gradient clipping）。其思想是在每次反向传播之后、执行优化器步进之前，对梯度的范数施加一个上限。
+
+给定（所有参数的）梯度 $g$，我们计算它的 $\ell_2$ 范数 $\|g\|_2$。如果该范数小于最大值 $M$，则保持 $g$ 不变；否则，我们把 $g$ 按因子 $\frac{M}{\|g\|_2 + \varepsilon}$ 缩小（其中加入一个很小的 $\varepsilon$，例如 $10^{-6}$，以保证数值稳定性）。注意，所得梯度的范数将恰好略低于 $M$。
+
+\subsubsection*{问题（gradient\_clipping）：实现梯度裁剪（1 分）}
+
+编写一个实现梯度裁剪的函数。该函数应接受一个参数列表和一个最大 $\ell_2$ 范数，并就地（in place）修改每个参数的梯度。使用 $\varepsilon = 10^{-6}$（PyTorch 的默认值）。然后，实现适配器 \tm{[adapters.run\_gradient\_clipping]}，并确保它能通过 \tm{uv run pytest -k test\_gradient\_clipping}。
+
+\section{训练循环（Training loop）}
+
+我们现在终于可以把目前为止构建好的主要组件组合在一起了：分词后的数据、模型和优化器。
+
+\subsection{数据加载器（Data Loader）}
+
+分词后的数据（例如你在 \tm{tokenizer\_experiments} 中准备的数据）是单个 token 序列 $x = (x_1, \ldots, x_n)$。即便源数据可能由多个相互独立的文档组成（例如不同的网页或源代码文件），常见的做法也是把它们全部拼接成一个 token 序列，并在文档之间加入分隔符（例如 \tm{<|endoftext|>} token）。
+
+数据加载器（data loader）把这些数据变成一个由批次（batch）组成的流：每个批次由 $B$ 个长度为 $m$ 的序列以及与之配对的相应下一个 token 组成，后者的长度同样为 $m$。例如，取 $B = 1$、$m = 3$，则 $([x_2, x_3, x_4],\, [x_3, x_4, x_5])$ 就是一个可能的批次。
+
+以这种方式加载数据能在多个方面简化训练。首先，任意满足 $1 \le i \le n - m$ 的 $i$ 都给出一个有效的训练序列，因此采样训练序列轻而易举。由于所有训练序列的长度都相同，无需对输入序列做填充（padding），这提高了硬件利用率（同时也因为可以增大批量大小 $B$）。最后，我们也不必为了采样训练数据而加载整个数据集，这使得处理那些原本可能无法全部装入内存的大型数据集变得容易。
+
+\subsubsection*{问题（data\_loading）：实现数据加载（2 分）}
+
+\textbf{交付要求：}编写一个函数，它接受一个 numpy 数组 $x$（由 token ID 组成的整数数组）、一个 \tm{batch\_size}、一个 \tm{context\_length} 以及一个 PyTorch 设备字符串（例如 \tm{'cpu'} 或 \tm{'cuda:0'}），并返回一对张量：采样得到的输入序列，以及与之对应的下一个 token 目标。两个张量的形状都应为 \tm{(batch\_size, context\_length)}、包含 token ID，并且都应放置在指定的设备上。要用我们提供的测试来检验你的实现，你需要先实现位于 \tm{[adapters.run\_get\_batch]} 的测试适配器。然后运行 \tm{uv run pytest -k test\_get\_batch} 来测试你的实现。
+
+\textbf{低资源提示：在 CPU 或 Apple Silicon 上加载数据}
+
+如果你打算在 CPU 或 Apple Silicon 上训练你的语言模型，就需要把数据移动到正确的设备上（同样地，之后你的模型也应使用相同的设备）。
+
+在 CPU 上，你可以使用 \tm{'cpu'} 设备字符串；在 Apple Silicon（M* 芯片）上，你可以使用 \tm{'mps'} 设备字符串。
+
+关于 MPS 的更多信息，请参考以下资源：
+\begin{itemize}
+  \item \url{https://docs.pytorch.org/docs/stable/mps.html}
+  \item \url{https://docs.pytorch.org/docs/stable/notes/mps.html}
+  \item \url{https://developer.apple.com/documentation/metalperformanceshaders}
+\end{itemize}
+
+如果数据集太大而无法全部加载进内存怎么办？我们可以使用名为 \tm{mmap} 的 Unix 系统调用，它把磁盘上的一个文件映射到虚拟内存，并在访问相应内存位置时才惰性地加载文件内容。这样，你就可以``假装''整个数据集都在内存里。Numpy 通过 \tm{np.memmap}（或者，如果你最初是用 \tm{np.save} 保存的数组，也可以给 \tm{np.load} 传入 \tm{mmap\_mode='r'} 标志）实现了这一功能：它会返回一个类似 numpy 数组的对象，在你访问条目时按需加载。\textbf{在训练期间从你的数据集（即 numpy 数组）中采样时，请务必以内存映射模式加载数据集}（通过 \tm{np.memmap}，或视你保存数组的方式给 \tm{np.load} 传入 \tm{mmap\_mode='r'} 标志）。另外，请确保指定与所加载数组相匹配的 \tm{dtype}。显式验证一下内存映射后的数据看起来是否正确（例如，其中不包含超出预期词表大小的值）可能会有帮助。
+
+\subsection{检查点（Checkpointing）}
+
+除了加载数据之外，我们还需要在训练过程中保存模型。运行作业时，我们常常希望能够恢复一个中途停止的训练运行（例如，作业超时、机器故障等）。即便一切顺利，我们之后可能也想访问中间阶段的模型（例如，事后研究训练动态、从训练的不同阶段采取样本等）。
+
+一个检查点（checkpoint）应当包含恢复训练所需的全部状态。我们当然至少要能恢复模型权重；如果使用有状态的优化器（例如 AdamW），我们还需要保存优化器的状态（对 AdamW 而言即矩估计）；最后，为了恢复学习率调度，我们还需要知道停止时所处的迭代次数。PyTorch 让保存所有这些状态变得很容易：每个 \tm{nn.Module} 都有一个 \tm{state\_dict()} 方法，它返回一个包含所有可学习权重的字典；之后我们可以用它的姊妹方法 \tm{load\_state\_dict()} 恢复这些权重。任何 \tm{torch.optim.Optimizer} 也是如此。最后，\tm{torch.save(obj, dest)} 可以把一个对象（例如一个以若干张量为值的字典，也可以是整数这类普通 Python 对象）转储到一个文件（路径）或类文件对象（file-like object）中，之后再用 \tm{torch.load(src)} 把它加载回内存。
+
+\subsubsection*{问题（checkpointing）：实现模型检查点（1 分）}
+
+实现以下两个函数来加载和保存检查点：
+
+\tm{def save\_checkpoint(model, optimizer, iteration, out)} 应把来自模型、优化器和迭代次数的所有状态转储到类文件对象 \tm{out} 中。你可以使用模型和优化器各自的 \tm{state\_dict} 方法来获取它们的相关状态，然后用 \tm{torch.save(obj, out)} 把 \tm{obj} 转储到 \tm{out}（PyTorch 在这里既支持路径，也支持类文件对象）。常见的做法是让 \tm{obj} 成为一个字典，但只要之后能够加载你的检查点，使用任何你想要的格式都可以。
+
+该函数需要以下参数：
+\begin{lstlisting}
+model: torch.nn.Module
+optimizer: torch.optim.Optimizer
+iteration: int
+out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+\end{lstlisting}
+
+\tm{def load\_checkpoint(src, model, optimizer)} 应从 \tm{src}（路径或类文件对象）加载一个检查点，然后从该检查点恢复模型和优化器的状态。你的函数应返回保存到检查点中的迭代次数。你可以使用 \tm{torch.load(src)} 来恢复你在 \tm{save\_checkpoint} 实现中保存的内容，并使用模型和优化器上的 \tm{load\_state\_dict} 方法让它们回到先前的状态。
+
+该函数需要以下参数：
+\begin{lstlisting}
+src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+model: torch.nn.Module
+optimizer: torch.optim.Optimizer
+\end{lstlisting}
+
+实现 \tm{[adapters.run\_save\_checkpoint]} 和 \tm{[adapters.run\_load\_checkpoint]} 适配器，并确保它们能通过 \tm{uv run pytest -k test\_checkpointing}。
+
+\subsection{训练循环（Training loop）}
+
+现在，终于可以把你实现的全部组件组合进你的主训练脚本了。让你的脚本便于以不同的超参数启动训练运行（例如，通过命令行参数传入超参数）将会带来回报，因为你之后会多次运行它，以研究不同的选择对训练的影响。
+
+\subsubsection*{问题（training\_together）：整合到一起（4 分）}
+
+\textbf{交付要求：}编写一个脚本，运行一个训练循环，在用户提供的输入上训练你的模型。特别地，我们建议你的训练脚本（至少）支持以下功能：
+\begin{itemize}
+  \item 能够配置和控制各种模型与优化器超参数。
+  \item 使用 \tm{np.memmap} 以低内存占用的方式加载大规模训练与验证数据集。
+  \item 把检查点序列化到用户提供的路径。
+  \item 定期记录训练与验证性能（例如，输出到控制台和/或像 Weights and Biases 这样的外部服务）。\footnote{\url{wandb.ai}}
+\end{itemize}
+
+\section{文本生成（Generating text）}
+
+既然我们已经能够训练模型了，还差最后一块：从我们的模型生成文本的能力。回顾一下，语言模型接受一个（可能是分批的）长度为 \tm{sequence\_length} 的整数序列，并产生一个大小为 \tm{(sequence\_length, vocab\_size)} 的矩阵，其中序列每个位置上的元素是一个预测该位置之后下一个 token 的概率分布。我们现在来编写几个函数，把它变成一个针对新序列的采样方案。
+
+\textbf{Softmax}
+
+按照惯例，语言模型的输出是最后一个线性层的输出（即 ``logits''），因此我们需要通过 softmax 运算把它变成归一化的概率。softmax 这个运算我们在前文的式~(10) 中已经见过。
+
+\textbf{解码（Decoding）}
+
+要从我们的模型生成文本（解码，decode），我们会向模型提供一个前缀 token 序列（即``提示词''，prompt），让它给出词表上的一个概率分布来预测序列中的下一个 token。然后，我们从这个词表分布中采样，以确定下一个输出 token。
+
+具体而言，解码过程的一步应接受序列 $x_{1..t}$，并通过下式返回一个 token $x_{t+1}$：
+\begin{align}
+P(x_{t+1} = i \mid x_{1..t}) &= \frac{\exp(v_i)}{\sum_{j} \exp(v_j)}
+\tag{21} \\
+v &= \operatorname{TransformerLM}(x_{1..t})_t \in \mathbb{R}^{\text{\tm{vocab\_size}}}
+\tag{22}
+\end{align}
+其中 TransformerLM 是我们的模型：它接受一个长度为 \tm{sequence\_length} 的序列作为输入，产生一个大小为 \tm{(sequence\_length, vocab\_size)} 的矩阵；我们取该矩阵的最后一个元素，因为我们要找的是第 $t$ 个位置上的下一个 token 预测。
+
+反复从这些单步条件分布中采样（并把先前生成的输出 token 追加到下一个解码时间步的输入中），直到生成出序列结束 token \tm{<|endoftext|>}（或达到用户指定的最大生成 token 数），我们就得到了一个基本的解码器。
+
+\textbf{解码技巧（Decoder tricks）}
+
+我们将使用小模型做实验，而小模型有时会生成质量很低的文本。两个简单的解码技巧可以帮助解决这些问题。第一个是\textit{温度缩放}（temperature scaling）：我们在 softmax 中引入一个温度参数 $\tau$，新的 softmax 为
+\begin{equation}
+\operatorname{softmax}(v, \tau)_i = \frac{\exp(v_i / \tau)}{\sum_{j=1}^{\text{\tm{vocab\_size}}} \exp(v_j / \tau)}.
+\tag{23}
+\end{equation}
+注意，把 $\tau$ 设为趋近 $0$ 会使 $v$ 中最大的元素占据主导，softmax 的输出随之变成一个集中在这个最大元素上的 one-hot 向量。
+
+第二个技巧是\textit{核采样}（nucleus sampling）或称 \textit{top-$p$ 采样}：通过截断低概率的 token 来修改采样分布。设 $q$ 是对大小为 \tm{vocab\_size} 的（经温度缩放的）softmax 得到的概率分布。带超参数 $p$ 的核采样按下式产生下一个 token：
+\begin{equation}
+P(x_{t+1} = i \mid q) =
+\begin{cases}
+\dfrac{q_i}{\sum_{j \in V(p)} q_j} & \text{若 } i \in V(p) \\
+0 & \text{否则}
+\end{cases}
+\tag{24}
+\end{equation}
+其中 $V(p)$ 是使得 $\sum_{j \in V(p)} q_j \ge p$ 成立的\textit{最小}下标集合。你可以先按大小对概率分布 $q$ 排序，然后不断选取最大的词表元素，直到达到目标水平 $p$，就能轻松计算出这个集合。
+
+\subsubsection*{问题（decoding）：解码（3 分）}
+
+\textbf{交付要求：}实现一个从你的语言模型解码（生成文本）的函数。我们建议你支持以下特性：
+\begin{itemize}
+  \item 为用户提供的提示词生成补全（即，接受某个 $x_{1..t}$，并持续采样补全，直到遇到一个 \tm{<|endoftext|>} token）。
+  \item 允许用户控制生成 token 的最大数量。
+  \item 给定期望的温度值，在采样之前对预测的下一个 token 分布应用 softmax 温度缩放。
+  \item Top-$p$ 采样（A.~Holtzman et al.~[27]，也称核采样），给定一个用户指定的阈值。
+\end{itemize}
+
+\section{实验（Experiments）}
+
+现在是时候把所有东西合在一起，在一个预训练数据集上训练（小）语言模型了。
+
+\subsection{如何运行实验与交付要求（How to Run Experiments and Deliverables）}
+
+理解 Transformer 各架构组件背后设计动机的最好方式，就是亲自动手修改并运行它。没有任何东西能替代亲身实践的经验。
+
+为此，能够\textbf{快速地、一致地}做实验，并\textbf{记录下你所做的事情}十分重要。为了快速实验，我们将在一个小规模模型（总参数量约 17M）和一个简单数据集（TinyStories）上运行大量实验。为了保持一致，你需要以系统化的方式消融（ablate）组件、改变超参数；为了留存记录，我们会要求你提交一份实验日志，以及与每个实验相关联的学习曲线。
+
+为了能够提交损失曲线，请确保\textbf{定期评估验证损失，并同时记录步数和实际运行时间（wall-clock time）}。你可能会发现 Weights and Biases 这类日志基础设施很有用。
+
+\subsubsection*{问题（experiment\_log）：实验日志（3 分）}
+
+为你的训练与评估代码搭建一套实验跟踪基础设施，使你能够跟踪各实验相对于梯度步数和实际运行时间的损失曲线。
+
+\textbf{交付要求：}实验所用日志基础设施的代码，以及本节下方各作业题目的实验日志（一份记录你所尝试过的所有事情的文档）。
+
+\subsection{TinyStories}
+
+我们将从一个非常简单的数据集（TinyStories；R.~Eldan et al.~[1]）开始：模型在上面训练得很快，我们也能观察到一些有趣的行为。获取该数据集的说明见第 1 节。下面是这个数据集的一个示例。
+
+\subsubsection*{示例（\tm{tinystories\_example}）：TinyStories 中的一个示例}
+
+（以下为语料原文样例，保留英文。）
+
+\textit{Once upon a time there was a little boy named Ben. Ben loved to explore the world around him. He saw many amazing things, like beautiful vases that were on display in a store. One day, Ben was walking through the store when he came across a very special vase. When Ben saw it he was amazed! He said, ``Wow, that is a really amazing vase! Can I buy it?'' The shopkeeper smiled and said, ``Of course you can. You can take it home and show all your friends how amazing it is!'' So Ben took the vase home and he was so proud of it! He called his friends over and showed them the amazing vase. All his friends thought the vase was beautiful and couldn't believe how lucky Ben was. And that's how Ben found an amazing vase in the store!}
+
+\subsubsection{超参数调优（Hyperparameter tuning）}
+
+我们会告诉你一些非常基础的超参数作为起点，并请你为其他超参数找到能良好工作的设置。
+
+\textbf{词表大小（Vocab size）10000。}典型的词表大小在几万到几十万之间。你应该改变这个值，观察词表和模型行为如何随之变化。
+
+\textbf{上下文长度（Context length）256。}像 TinyStories 这样的简单数据集可能不需要很长的序列，但对于后面的 OpenWebText 数据，你可能想改变这个值。请尝试改变它，观察其对单次迭代运行时间和最终困惑度（perplexity）的影响。
+
+\textbf{\tm{d\_model} 512。}这比许多小型 Transformer 论文中使用的 768 维略小，但会让一切更快。
+
+\textbf{\tm{d\_ff} 1344。}这大约是 $\tfrac{8}{3}\,d_{\mathrm{model}}$，同时又是 64 的倍数，这对 GPU 性能有利。
+
+\textbf{RoPE $\Theta$ 参数（theta）10000。}
+
+\textbf{层数与头数}4 层、16 头。这总共会给出约 17M 非嵌入（non-embedding）参数，是一个相当小的 Transformer。
+
+\textbf{处理的总 token 数（Total tokens processed）}327,680,000（你的批量大小 $\times$ 总步数 $\times$ 上下文长度应约等于该值）。
+
+你应该通过反复试验，为以下其他超参数找到合适的默认值：学习率、学习率预热、其他 AdamW 超参数（$\beta_1, \beta_2, \varepsilon$），以及权重衰减（weight decay）。你可以在 D.~P.~Kingma et al.~[22] 中找到这类超参数的一些典型取值。
+
+\subsubsection{整合到一起（Putting it together）}
+
+现在，你可以把所有东西组合到一起了：拿到一个训练好的 BPE 分词器，对训练数据集进行分词，然后在你编写的训练循环中运行。\textbf{重要提示：}如果你的实现正确且高效，上述超参数应当能在 1 块 B200 GPU 上取得约 20--30 分钟的运行时间。如果你的运行时间要长得多，请检查你的数据加载、检查点保存或验证损失代码是否成为了运行时间的瓶颈，以及你的实现是否正确地进行了批处理（batching）。
+
+\subsubsection{调试模型架构的技巧与窍门（Tips and tricks for debugging model architectures）}
+
+我们强烈建议你熟练掌握 IDE 内置的调试器（例如 VSCode/Zed），与使用 print 语句调试相比，它会为你节省时间。如果你使用文本编辑器，可以使用 \tm{ipdb} 之类的工具。调试模型架构时，还有一些其他好习惯：
+\begin{itemize}
+  \item 开发任何神经网络架构时，一个常见的第一步是\textbf{过拟合单个 minibatch}。如果你的实现正确，你应该能很快把训练损失压到接近零。
+  \item 在各个模型组件中设置调试断点，检查中间张量的形状，确保它们符合你的预期。
+  \item 监控激活值、模型权重和梯度的范数，确保它们没有爆炸或消失。
+\end{itemize}
+
+\subsubsection*{问题（learning\_rate）：调整学习率（2 B200 小时）（3 分）}
+
+学习率是最重要的待调超参数之一。以你训练好的基础模型为出发点，回答以下问题：
+\begin{enumerate}
+  \item[(a)] 对学习率做一次超参数扫描（sweep），并报告最终的损失（如果优化器发散，请注明发散）。
+
+  \textbf{交付要求：}与多个学习率相对应的学习曲线。请解释你的超参数搜索策略。
+
+  \textbf{交付要求：}一个在 TinyStories 上验证损失（每 token）不超过 1.45 的模型。
+
+  \textbf{低资源提示：在 CPU 或 Apple Silicon 上训练几步}
+
+  如果你是在 \tm{cpu} 或 \tm{mps} 上运行，你应当改为把处理的总 token 数降到 40,000,000，这已足以产生相当流畅的文本。你也可以把目标验证损失从 1.45 放宽到 2.00。
+
+  我们在 M4 Max 芯片和 36 GB 内存的机器上，用调好的学习率运行我们的参考实现：批量大小 $\times$ 总步数 $\times$ 上下文长度 $= 32 \times 5000 \times 256 = 40{,}960{,}000$ 个 token，在 \tm{cpu} 上耗时 1 小时 22 分钟，在 \tm{mps} 上耗时 36 分钟。在第 5000 步时，我们取得了 1.80 的验证损失。
+
+  另外一些提示：
+  \begin{itemize}
+    \item 使用 $N$ 个训练步时，我们建议调整余弦学习率衰减调度，使其恰好在第 $N$ 步终止衰减（即达到最小学习率）。
+    \item 使用 \tm{mps} 时，请\textbf{不要}使用 TF32 内核，也就是说，不要像对 \tm{cuda} 设备那样设置
+    \begin{lstlisting}
+torch.set_float32_matmul_precision('high')
+    \end{lstlisting}
+    我们曾尝试在 \tm{mps}（torch 版本 2.9.0）上启用 TF32 内核，发现后端有时会悄悄使用有缺陷的内核，导致训练不稳定。
+    \item 你可以通过 \tm{torch.compile} 对模型进行 JIT 编译来加速训练。具体而言：
+    \begin{itemize}
+      \item 在 \tm{cpu} 上，用如下代码编译你的模型：
+      \begin{lstlisting}
+model = torch.compile(model)
+      \end{lstlisting}
+      \item 在 \tm{mps} 上，你可以用如下方式在一定程度上优化反向传播：
+      \begin{lstlisting}
+model = torch.compile(model, backend="aot_eager")
+      \end{lstlisting}
+    \end{itemize}
+    截至 torch 版本 2.9.0，\tm{mps} 尚不支持使用 Inductor 进行编译。
+  \end{itemize}
+  \item[(b)] 民间经验认为，最好的学习率位于``稳定性边缘''（edge of stability）。请调查学习率开始发散的临界点与你最佳学习率之间的关系。
+
+  \textbf{交付要求：}学习率递增的一系列学习曲线，其中至少包含一次发散的运行，并分析这与收敛速度之间的关系。
+\end{enumerate}
+
+现在让我们改变批量大小，看看训练会发生什么。批量大小很重要——它让我们能通过更大的矩阵乘法从 GPU 中获得更高的效率，但批量大小一定是越大越好吗？让我们运行一些实验来一探究竟。
+
+\subsubsection*{问题（batch\_size\_experiment）：批量大小变化（1 B200 小时）（1 分）}
+
+把你的批量大小从 1 一直变到 GPU 内存上限。中间至少尝试几个批量大小，包括 64 和 128 这样的典型值。
+
+\textbf{交付要求：}不同批量大小下各次运行的学习曲线。如有必要，学习率应当重新优化。
+
+\textbf{交付要求：}用几句话讨论你对批量大小及其对训练影响的发现。
+
+解码器在手，我们就可以生成文本了！我们将从模型生成文本，看看它效果如何。作为参照，你得到的输出至少应当与下面的示例一样好。
+
+\subsubsection*{示例（\tm{ts\_generate\_example}）：TinyStories 语言模型的输出样例}
+
+（以下为模型输出原文样例，保留英文。）
+
+\textit{Once upon a time, there was a pretty girl named Lily. She loved to eat gum, especially the big black one. One day, Lily's mom asked her to help cook dinner. Lily was so excited! She loved to help her mom. Lily's mom made a big pot of soup for dinner. Lily was so happy and said, ``Thank you, Mommy! I love you.'' She helped her mom pour the soup into a big bowl. After dinner, Lily's mom made some yummy soup. Lily loved it! She said, ``Thank you, Mommy! This soup is so yummy!'' Her mom smiled and said, ``I'm glad you like it, Lily.'' They finished cooking and continued to cook together. The end.}
+
+\textbf{低资源提示：在 CPU 或 Apple Silicon 上生成文本}
+
+如果你使用的是处理了 40M token 的低资源配置，你应该会看到生成结果仍然像英语，但不如上面的流畅。例如，下面是一个在 40M token 上训练的 TinyStories 语言模型的输出样例：
+
+\textit{Once upon a time, there was a little girl named Sue. Sue had a tooth that she loved very much. It was his best head. One day, Sue went for a walk and met a ladybug! They became good friends and played on the path together.}
+
+\textit{``Hey, Polly! Let's go out!'' said Tim. Sue looked at the sky and saw that it was difficult to find a way to dance shining. She smiled and agreed to help the talking!''}
+
+\textit{As Sue watched the sky moved, what it was. She}
+
+下面是精确的题目描述以及我们的要求：
+
+\subsubsection*{问题（generate）：生成文本（1 分）}
+
+使用你的解码器和训练好的检查点，报告你的模型生成的文本。你可能需要调整解码器参数（温度、top-p 等）才能得到流畅的输出。
+
+\textbf{交付要求：}至少 256 个 token 的文本转储（或在第一个 \tm{<|endoftext|>} token 处截止），并对该输出的流畅度做简要点评，指出至少两个影响输出好坏的因素。
+
+\subsection{消融实验与架构修改（Ablations and architecture modification）}
+
+理解 Transformer 的最好方式，就是亲自动手修改它并观察它的行为。我们现在来做几个简单的消融实验和修改。
+
+\textbf{消融实验 1：层归一化（layer normalization）}
+
+人们常说，层归一化对 Transformer 训练的稳定性十分重要。但也许我们想冒险一试。让我们把每个 Transformer 块中的 RMSNorm 都移除，看看会发生什么。
+
+\subsubsection*{问题（layer\_norm\_ablation）：移除 RMSNorm 并训练（0.5 B200 小时）（1 分）}
+
+从你的 Transformer 中移除所有 RMSNorm 并训练。在之前最优的学习率下会发生什么？使用较低的学习率能获得稳定性吗？
+
+\textbf{交付要求：}移除 RMSNorm 进行训练的学习曲线，以及最佳学习率下的学习曲线。
+
+\textbf{交付要求：}用几句话点评 RMSNorm 的影响。
+
+现在让我们研究另一个初看之下显得随意的层归一化选择。\textit{Pre-norm}（前置归一化）Transformer 块定义为
+\begin{equation}
+z = x + \operatorname{MultiHeadSelfAttention}(\operatorname{RMSNorm}(x))
+\tag{25}
+\end{equation}
+\begin{equation}
+y = z + \operatorname{FFN}(\operatorname{RMSNorm}(z)).
+\tag{26}
+\end{equation}
+这是对原始 Transformer 架构为数不多的``共识''修改之一；原始架构使用的是 \textit{post-norm}（后置归一化）方式：
+\begin{equation}
+z = \operatorname{RMSNorm}(x + \operatorname{MultiHeadSelfAttention}(x))
+\tag{27}
+\end{equation}
+\begin{equation}
+y = \operatorname{RMSNorm}(z + \operatorname{FFN}(z)).
+\tag{28}
+\end{equation}
+让我们改回 \textit{post-norm} 方式，看看会发生什么。
+
+\subsubsection*{问题（pre\_norm\_ablation）：实现 post-norm 并训练（0.5 B200 小时）（1 分）}
+
+把你的 pre-norm Transformer 实现修改成 post-norm 版本。用 post-norm 模型训练，看看会发生什么。
+
+\textbf{交付要求：}post-norm Transformer 的学习曲线，并与 pre-norm 版本进行比较。
+
+我们看到，层归一化对 Transformer 的行为有重大影响，甚至连层归一化的位置都很重要。
+
+\textbf{消融实验 2：位置嵌入（position embeddings）}
+
+接下来，我们将研究位置嵌入对模型性能的影响。具体而言，我们会把基础模型（使用 RoPE）与完全不使用位置嵌入（NoPE）进行比较。事实证明，decoder-only Transformer（即像我们实现的那样带因果掩码的 Transformer）在理论上可以在不显式提供位置嵌入的情况下推断出相对或绝对位置信息（Y.-H.~H.~Tsai et al.~[28]；A.~Kazemnejad et al.~[29]）。我们现在通过实验来检验 NoPE 与 RoPE 相比表现如何。
+
+\subsubsection*{问题（no\_pos\_emb）：实现 NoPE（0.5 B200 小时）（1 分）}
+
+修改你带 RoPE 的 Transformer 实现，把位置嵌入信息完全移除，看看会发生什么。
+
+\textbf{交付要求：}比较 RoPE 与 NoPE 性能的学习曲线。
+
+\textbf{消融实验 3：SwiGLU 与 SiLU（SwiGLU vs.\ SiLU）}
+
+接下来，我们将沿用 N.~Shazeer~[20] 的思路，通过比较 SwiGLU 前馈网络与使用 SiLU 激活但没有门控线性单元（GLU）的前馈网络的性能，来检验前馈网络中门控的重要性：
+\begin{equation}
+\operatorname{FFN}_{\operatorname{SiLU}}(x) = W_2\, \operatorname{SiLU}(W_1 x).
+\tag{29}
+\end{equation}
+回顾一下，在我们的 SwiGLU 实现中，我们把内层前馈层的维度设为大约 $d_{\mathrm{ff}} = \tfrac{8}{3}\,d_{\mathrm{model}}$（同时确保 $d_{\mathrm{ff}} \bmod 64 = 0$，以便利用 GPU 张量核心）。在这个消融基线中，你的 $\operatorname{FFN}_{\operatorname{SiLU}}$ 实现应改为设 $d_{\mathrm{ff}} = 4 \times d_{\mathrm{model}}$，以近似匹配默认 SwiGLU 前馈网络的参数量（后者有三而非两个权重矩阵）。
+
+\subsubsection*{问题（swiglu\_ablation）：SwiGLU 与 SiLU（0.5 B200 小时）（1 分）}
+
+\textbf{交付要求：}在参数量近似匹配的前提下，比较 SwiGLU 与 SiLU 前馈网络性能的学习曲线。
+
+\textbf{交付要求：}用几句话讨论你的发现。
+
+\textbf{低资源提示：GPU 资源有限的线上学员应在 TinyStories 上测试修改}
+
+在作业的剩余部分，我们将转向一个更大规模、噪声更多的网页数据集（OpenWebText），试验架构修改，并（可选地）向课程排行榜提交成绩。
+
+在 OpenWebText 上把语言模型训练到流畅需要很长时间，因此我们建议 GPU 资源有限的线上学员继续在 TinyStories 上测试各种修改（以验证损失作为评估性能的指标）。
+
+\subsection{在 OpenWebText 上运行（Running on OpenWebText）}
+
+我们现在转向一个更标准的预训练数据集，它由网络爬取数据构建。我们还提供了 OpenWebText（A.~Gokaslan et al.~[2]）的一个小样本，作为一个单独的文本文件：如何获取该文件见第 1 节。
+
+下面是来自 OpenWebText 的一个示例。注意这些文本要真实、复杂、多样得多。你不妨浏览一遍训练数据集，感受一下网络抓取语料的训练数据是什么样子。
+
+\subsubsection*{示例（\tm{owt\_example}）：OWT 中的一个示例}
+
+（以下为语料原文样例，保留英文。）
+
+\textit{Baseball Prospectus director of technology Harry Pavlidis took a risk when he hired Jonathan Judge.}
+
+\textit{Pavlidis knew that, as Alan Schwarz wrote in The Numbers Game, ``no corner of American culture is more precisely counted, more passionately quantified, than performances of baseball players.'' With a few clicks here and there, you can find out that Noah Syndergaard's fastball revolves more than 2,100 times per minute on its way to the plate, that Nelson Cruz had the game's highest average exit velocity among qualified hitters in 2016 and myriad other tidbits that seem ripped from a video game or science fiction novel. The rising ocean of data has empowered an increasingly important actor in baseball's culture: the analytical hobbyist.}
+
+\textit{That empowerment comes with added scrutiny -- on the measurements, but also on the people and publications behind them. With Baseball Prospectus, Pavlidis knew all about the backlash that accompanies quantitative imperfection. He also knew the site's catching metrics needed to be reworked, and that it would take a learned mind -- someone who could tackle complex statistical modeling problems -- to complete the job.}
+
+\textit{``He freaks us out.'' Harry Pavlidis}
+
+\textit{Pavlidis had a hunch that Judge ``got it'' based on the latter's writing and their interaction at a site-sponsored ballpark event. [\ldots]}
+
+\textbf{注意：}在这个实验中，你可能需要重新调整学习率或批量大小等超参数。
+
+\subsubsection*{问题（main\_experiment）：在 OWT 上做实验（2 B200 小时）（2 分）}
+
+在 OpenWebText 上，使用与 TinyStories 相同的模型架构和总训练迭代次数来训练你的语言模型。这个模型表现如何？
+
+\textbf{交付要求：}你的语言模型在 OpenWebText 上的学习曲线。描述损失与 TinyStories 上的差异——我们应该如何解读这些损失？
+
+\textbf{交付要求：}OpenWebText 语言模型生成的文本，格式与 TinyStories 的输出相同。这段文本的流畅度如何？既然模型和计算预算与 TinyStories 相同，为什么输出质量更差？
+
+\subsection{你自己的改进 + 排行榜（Your own modification + leaderboard）}
+
+恭喜你走到这一步。你马上就要完成了！现在，你将尝试改进 Transformer 架构，看看你的超参数和架构与班上其他同学相比表现如何。
+
+\textbf{排行榜规则}
+
+除以下规则外，没有任何限制：
+
+\textbf{运行时间（Runtime）：}你的提交在 B200 上最多可以运行 45 分钟。如果你使用 SLURM 或 Modal，可能需要在你的提交脚本中自行强制执行这一限制。
+
+\textbf{数据（Data）：}你只能使用我们提供的 OpenWebText 训练数据集。
+
+除此之外，你可以随心所欲。
+
+如果你想寻找一些可以实现的想法，可以看看以下资源：
+\begin{itemize}
+  \item 最先进的开源 LLM 系列，例如 Llama 3（A.~Grattafiori et al.~[14]）或 Qwen 2.5（A.~Yang et al.~[15]）。
+  \item NanoGPT speedrun 仓库（\url{github.com/KellerJordan/modded-nanogpt}），社区成员在上面发布了大量用于``极速通关''（speedrunning）小规模语言模型预训练的有趣修改。例如，一个可以追溯到原始 Transformer 论文的常见修改是把输入嵌入和输出嵌入的权重绑在一起（weight tying）（见 A.~Vaswani et al.~[8]（第 3.4 节）与 A.~Chowdhery et al.~[16]（第 2 节））。如果你真的尝试权重绑定，可能需要降低嵌入/LM 头初始化的标准差。
+\end{itemize}
+
+在尝试完整的 45 分钟运行之前，你应当先在 OpenWebText 的一个小子集上或在 TinyStories 上测试这些想法。
+
+需要提醒的是，我们注意到，一些在这个排行榜上表现良好的修改未必能推广到更大规模的预训练。我们将在课程的缩放定律（scaling laws）单元进一步探讨这个问题。
+
+\subsubsection*{问题（leaderboard）：排行榜（10 B200 小时）（6 分）}
+
+你将在上述排行榜规则下训练一个模型，目标是在 0.75 B200 小时内使你的语言模型的验证损失最小化。
+
+\textbf{交付要求：}记录到的最终验证损失、一条清晰标明实际运行时间横轴小于 45 分钟的对应学习曲线，以及对你所做工作的描述。我们期望排行榜提交至少击败 5.0 损失这一朴素基线。在此提交排行榜：\url{github.com/stanford-cs336/assignment1-basics-leaderboard}。
+
+\section*{参考文献（Bibliography）}
+
+\begin{itemize}[leftmargin=3em, label={}]
+  \item[\tm{[1]}] R. Eldan and Y. Li, ``TinyStories: How Small Can Language Models Be and Still Speak Coherent English?.'' 2023.
+  \item[\tm{[2]}] A. Gokaslan, V. Cohen, E. Pavlick, and S. Tellex, ``OpenWebText corpus.'' 2019.
+  \item[\tm{[3]}] R. Sennrich, B. Haddow, and A. Birch, ``Neural Machine Translation of Rare Words with Subword Units,'' in \textit{Proc. of ACL}, 2016.
+  \item[\tm{[4]}] C. Wang, K. Cho, and J. Gu, ``Neural Machine Translation with Byte-Level Subwords.'' 2019.
+  \item[\tm{[5]}] P. Gage, ``A new algorithm for data compression,'' \textit{C Users Journal}, vol. 12, no. 2, pp. 23--38, Feb. 1994.
+  \item[\tm{[6]}] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, and I. Sutskever, ``Language Models are Unsupervised Multitask Learners.'' 2019.
+  \item[\tm{[7]}] A. Radford, K. Narasimhan, T. Salimans, and I. Sutskever, ``Improving Language Understanding by Generative Pre-Training.'' 2018.
+  \item[\tm{[8]}] A. Vaswani \textit{et al.}, ``Attention is All you Need,'' in \textit{Proc. of NeurIPS}, 2017.
+  \item[\tm{[9]}] T. Q. Nguyen and J. Salazar, ``Transformers without Tears: Improving the Normalization of Self-Attention,'' in \textit{Proc. of IWSLT}, 2019.
+  \item[\tm{[10]}] R. Xiong \textit{et al.}, ``On Layer Normalization in the Transformer Architecture,'' in \textit{Proc. of ICML}, 2020.
+  \item[\tm{[11]}] J. L. Ba, J. R. Kiros, and G. E. Hinton, ``Layer Normalization.'' 2016.
+  \item[\tm{[12]}] H. Touvron \textit{et al.}, ``LLaMA: Open and Efficient Foundation Language Models.'' 2023.
+  \item[\tm{[13]}] B. Zhang and R. Sennrich, ``Root Mean Square Layer Normalization,'' in \textit{Proc. of NeurIPS}, 2019.
+  \item[\tm{[14]}] A. Grattafiori \textit{et al.}, ``The Llama 3 Herd of Models.'' [Online]. Available: \url{https://arxiv.org/abs/2407.21783}
+  \item[\tm{[15]}] A. Yang \textit{et al.}, ``Qwen2.5 Technical Report,'' \textit{arXiv preprint arXiv:2412.15115}, 2024.
+  \item[\tm{[16]}] A. Chowdhery \textit{et al.}, ``PaLM: Scaling Language Modeling with Pathways.'' 2022.
+  \item[\tm{[17]}] D. Hendrycks and K. Gimpel, ``Bridging Nonlinearities and Stochastic Regularizers with Gaussian Error Linear Units.'' 2016.
+  \item[\tm{[18]}] S. Elfwing, E. Uchibe, and K. Doya, ``Sigmoid-Weighted Linear Units for Neural Network Function Approximation in Reinforcement Learning.'' [Online]. Available: \url{https://arxiv.org/abs/1702.03118}
+  \item[\tm{[19]}] Y. N. Dauphin, A. Fan, M. Auli, and D. Grangier, ``Language Modeling with Gated Convolutional Networks.'' [Online]. Available: \url{https://arxiv.org/abs/1612.08083}
+  \item[\tm{[20]}] N. Shazeer, ``GLU Variants Improve Transformer.'' 2020.
+  \item[\tm{[21]}] J. Su, Y. Lu, S. Pan, B. Wen, and Y. Liu, ``RoFormer: Enhanced Transformer with Rotary Position Embedding.'' 2021.
+  \item[\tm{[22]}] D. P. Kingma and J. Ba, ``Adam: A Method for Stochastic Optimization,'' in \textit{Proc. of ICLR}, 2015.
+  \item[\tm{[23]}] I. Loshchilov and F. Hutter, ``Decoupled Weight Decay Regularization,'' in \textit{Proc. of ICLR}, 2019.
+  \item[\tm{[24]}] T. B. Brown \textit{et al.}, ``Language Models are Few-Shot Learners,'' in \textit{Proc. of NeurIPS}, 2020.
+  \item[\tm{[25]}] J. Kaplan \textit{et al.}, ``Scaling Laws for Neural Language Models.'' 2020.
+  \item[\tm{[26]}] J. Hoffmann \textit{et al.}, ``Training Compute-Optimal Large Language Models.'' 2022.
+  \item[\tm{[27]}] A. Holtzman, J. Buys, L. Du, M. Forbes, and Y. Choi, ``The Curious Case of Neural Text Degeneration,'' in \textit{Proc. of ICLR}, 2020.
+  \item[\tm{[28]}] Y.-H. H. Tsai, S. Bai, M. Yamada, L.-P. Morency, and R. Salakhutdinov, ``Transformer Dissection: An Unified Understanding for Transformer's Attention via the Lens of Kernel,'' in \textit{Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP)}, K. Inui, J. Jiang, V. Ng, and X. Wan, Eds., Hong Kong, China: Association for Computational Linguistics, Nov. 2019, pp. 4344--4353. doi: 10.18653/v1/D19-1443.
+  \item[\tm{[29]}] A. Kazemnejad, I. Padhi, K. Natesan, P. Das, and S. Reddy, ``The Impact of Positional Encoding on Length Generalization in Transformers,'' in \textit{Thirty-seventh Conference on Neural Information Processing Systems}, 2023. [Online]. Available: \url{https://openreview.net/forum?id=Drrl2gcjzl}
+\end{itemize}

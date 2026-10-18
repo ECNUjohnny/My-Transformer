@@ -1,0 +1,581 @@
+% ==================== 原文第 14 页 ====================
+% （接上一页代码清单的结尾）
+\begin{lstlisting}
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir)
+    return model, tokenizer
+\end{lstlisting}
+
+\tm{model\_id\_or\_directory} 可以是类似 \tm{allenai/OLMo-2-0425-1B} 的模型名称，也可以是一个目录路径。该目录通常就是调用 \tm{save\_pretrained} 的结果——你可以调用它来保存自己训练的模型：
+
+\begin{lstlisting}
+# Save the model weights
+model.save_pretrained(save_directory=output_dir)
+tokenizer.save_pretrained(save_directory=output_dir)
+\end{lstlisting}
+
+首先，让我们实现一个辅助函数，它使用预训练的分词器对输入的提示（prompt）和回答（response）进行分词。请分别对提示和回答分词、不添加任何特殊 token，然后把它们直接拼接为 \tm{prompt\_ids + response\_ids}，中间不插入 EOS、BOS 或任何分隔 token。我们还需要构造一个 \tm{response\_mask}：一个布尔掩码，与右移后的 \tm{labels} 对齐，在标签 token 来自回答的位置恰好为 \tm{True}，在提示与填充（padding）位置为 \tm{False}。我们将在训练循环中使用这个掩码，以确保只对回答部分的 token 计算损失。
+
+\medskip
+\noindent\textbf{问题（\tm{tokenize\_prompt\_and\_output}）：提示与输出的分词（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}实现一个方法 \tm{tokenize\_prompt\_and\_output}，它分别对提示和输出分词、在不插入特殊 token 的情况下把它们拼接在一起，并构造出 \tm{response\_mask}。推荐使用如下接口：
+
+\begin{lstlisting}
+def tokenize_prompt_and_output(
+       prompt_strs: list[str],
+       output_strs: list[str],
+       tokenizer: PreTrainedTokenizer,
+
+) -> dict[str, torch.Tensor]:
+\end{lstlisting}
+
+对提示和输出字符串分词，并构造一个与 \tm{labels} 对齐的掩码：回答 token 对应的位置为 1，其他位置（提示或填充）为 0。
+
+参数：
+
+\begin{itemize}
+  \item \tm{prompt\_strs: list[str]} 提示字符串的列表。
+  \item \tm{output\_strs: list[str]} 输出字符串的列表。
+  \item \tm{tokenizer: PreTrainedTokenizer} 用于分词的分词器。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{dict[str, torch.Tensor]}。设 \tm{prompt\_and\_output\_lens} 为一个列表，包含拼接后的提示与输出字符串各自的长度。那么返回的字典应包含以下键：
+  \begin{itemize}
+    \item \tm{input\_ids}：形状为 \tm{(batch\_size, max(prompt\_and\_output\_lens) - 1)} 的 \tm{torch.Tensor}：分词后的提示与输出字符串，切掉了最后一个 token。
+    \item \tm{labels}：形状为 \tm{(batch\_size, max(prompt\_and\_output\_lens) - 1)} 的 \tm{torch.Tensor}：右移后的 input ids，即去掉了第一个 token 的 input ids。
+    \item \tm{response\_mask}：形状为 \tm{(batch\_size, max(prompt\_and\_output\_lens) - 1)} 的 \tm{torch.Tensor}：与 \tm{labels} 对齐的掩码，当对应的标签 token 属于回答时取值为 1，否则为 0。
+  \end{itemize}
+\end{itemize}
+
+要测试你的代码，请实现 \tm{adapters.run\_tokenize\_prompt\_and\_output}。然后用 \tm{uv run pytest -k test\_tokenize\_prompt\_and\_output} 运行测试，确保你的实现通过测试。
+
+拿到分词后的输入之后，我们可以把它传入模型：
+
+\begin{lstlisting}
+input_ids = train_batch["input_ids"].to(device)
+labels = train_batch["labels"].to(device)
+logits = model(input_ids).logits
+\end{lstlisting}
+
+掌握这一语法后，请实现下面这个方法：它计算模型下回答中每个 token 的对数概率（log-probability）——这是计算策略梯度所需要的基本量。在强化学习（RL）中，记录每个 token 的熵（entropy）也往往很有用，因此该函数还包含一个需要你一并实现的 \tm{return\_token\_entropy} 选项。
+
+\medskip
+\noindent\textbf{问题（\tm{get\_response\_log\_probs}）：响应的对数概率（与熵）（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}实现一个方法 \tm{get\_response\_log\_probs}，它从因果语言模型中获取每个 token 的条件对数概率（在给定前面 token 的条件下），并可选地返回模型下一 token 分布的熵。
+
+% ==================== 原文第 15 页 ====================
+推荐使用如下接口：
+
+\begin{lstlisting}
+def get_response_log_probs(
+       model: PreTrainedModel,
+       input_ids: torch.Tensor,
+       labels: torch.Tensor,
+       return_token_entropy: bool = False,
+
+) -> dict[str, torch.Tensor]:
+\end{lstlisting}
+
+参数：
+
+\begin{itemize}
+  \item \tm{model: PreTrainedModel} 用于打分的 HuggingFace 模型（应放在正确的设备上；如果不需要计算梯度，则处于推理模式）。
+  \item \tm{input\_ids: torch.Tensor} 形状为 \tm{(batch\_size, sequence\_length)}，由你的分词方法产生的提示 + 回答拼接后的 token。
+  \item \tm{labels: torch.Tensor} 形状为 \tm{(batch\_size, sequence\_length)}，由你的分词方法产生的 labels。
+  \item \tm{return\_token\_entropy: bool} 若为 \tm{True}，则同时返回每个 token 的熵。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{dict[str, torch.Tensor]}。
+  \begin{itemize}
+    \item \tm{"log\_probs"} 形状为 \tm{(batch\_size, sequence\_length)}，条件对数概率 $\log p_\theta(x_t \mid x_{<t})$。
+    \item \tm{"token\_entropy"} 可选，形状为 \tm{(batch\_size, sequence\_length)}，每个位置上 token 的熵（仅当 \tm{return\_token\_entropy=True} 时存在）。
+  \end{itemize}
+\end{itemize}
+
+% ==================== 原文第 16 页 ====================
+要测试你的代码，请实现 \tm{adapters.run\_get\_response\_log\_probs}。然后运行 \tm{uv run pytest -k test\_get\_response\_log\_probs}，确保测试通过。
+
+\subsubsection{在强化学习循环中使用 vLLM}
+
+在 RL 循环中，我们还需要生成 rollout（即模型对提示的采样回答）。我们将采用的具体配置是：把 Hugging Face 模型和优化器放在一块 GPU 上用于训练，把 vLLM（包含模型和 KV 缓存）放在另一块 GPU 上。因此，除了上一节描述的 vLLM 初始化与生成函数之外，我们还需要在每次推理步骤之前在两个设备之间同步权重。权重量同步代码如下，位于 \tm{cs336\_alignment/vllm\_utils.py}。
+
+\begin{lstlisting}
+@dataclass
+class VLLMServer:
+    gpu: int = 1 # Run training on gpu 0 and inference on gpu 1
+
+    # Create the NCCL weight-transfer group between the training GPU and vLLM.
+    def init_weight_sync(self, policy_device: str): ...
+
+    # Copy the current Hugging Face policy weights into the vLLM server and
+    # reset vLLM caches that depended on the old weights.
+    def sync_policy_weights(self, policy: torch.nn.Module) -> None: ...
+
+    # Generate rollouts from the current vLLM weights.
+    def generate_completions(
+        self,
+        prompts: list[str],
+        sampling_params: dict,
+        batch_size: int | None = None,
+    ) -> list[VLLMCompletion]: ...
+\end{lstlisting}
+
+与之前的提示实验一样，我们使用温度 1.0、top-p 1.0、最大生成长度 512 进行采样。提示词要求模型以字符串 \tm{</answer>} 结束它的回答，因此我们可以指示 vLLM 在模型输出该字符串时停止生成：
+
+\begin{lstlisting}
+# Based on Dr. GRPO: stop when the model completes its answer
+# https://github.com/sail-sg/understand-r1-zero/blob/
+#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167
+sampling_params['stop'] = ["</answer>"]
+sampling_params['include_stop_str_in_output'] = True
+\end{lstlisting}
+
+\subsubsection{GRPO 组件}
+
+接下来，让我们实现用于计算 GRPO 损失各个部分的一些组件。注意，在作业的后面部分，我们会实现各种变体，比如不同的优势（advantage）归一化方法或重要性重加权（importance reweighting）方法。下面的组件在设计上允许我们以最少的代码重复在各变体之间切换，因此我们提供的接口带有用于指定变体的参数。在作业的这一部分，你只需要实现标准 GRPO 变体。
+
+我们的第一步是实现一个辅助函数，用于计算各个回答的奖励。
+
+\medskip
+\noindent\textbf{问题（\tm{compute\_rollout\_rewards}）：计算 rollout 的奖励（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+% ==================== 原文第 17 页 ====================
+\textbf{交付要求：}实现一个方法 \tm{compute\_rollout\_rewards}，为每条 rollout 回答计算原始奖励。
+
+推荐使用如下接口：
+
+\begin{lstlisting}
+def compute_rollout_rewards(
+       reward_fn: Callable[[str, str], dict[str, float]],
+       rollout_responses: list[str],
+       repeated_ground_truths: list[str],
+
+) -> tuple[torch.Tensor, dict[str, float]]:
+\end{lstlisting}
+
+为一组 rollout 回答计算奖励，并返回奖励各组成部分的元数据（metadata）。
+
+参数：
+
+\begin{itemize}
+  \item \tm{reward\_fn: Callable[[str, str], dict[str, float]]} 将 rollout 回答与标准答案对比打分，产生一个包含键 \tm{"reward"}、\tm{"format\_reward"} 和 \tm{"answer\_reward"} 的字典。
+  \item \tm{rollout\_responses: list[str]} 来自策略的 rollout。该列表的长度为 \tm{rollout\_batch\_size = n\_prompts\_per\_rollout\_batch * group\_size}。
+  \item \tm{repeated\_ground\_truths: list[str]} 各样本的标准答案。该列表的长度为 \tm{rollout\_batch\_size}，因为每个样本的标准答案会重复 \tm{group\_size} 次。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{tuple[torch.Tensor, dict[str, float]]}。
+  \begin{itemize}
+    \item \tm{raw\_rewards} 形状为 \tm{(rollout\_batch\_size,)}。每条 rollout 回答的未归一化奖励。
+    \item \tm{metadata} 要记录的奖励统计量。至少要包含整个 rollout 批次上总奖励和格式奖励的均值。
+  \end{itemize}
+\end{itemize}
+
+要测试你的代码，请实现 \tm{adapters.run\_compute\_rollout\_rewards}。然后用 \tm{uv run pytest -k compute\_rollout\_rewards} 运行测试，确保你的实现通过测试。
+
+接下来，让我们实现 GRPO 中的核心数学：将这些奖励归一化，从而把它们转化为优势。注意，上面函数输出的奖励是被拉平（flatten）的，因此我们需要传入组大小（group size），把它重新整理成一个个组再做归一化。为了通过测试，你需要支持 \tm{baseline = "mean"} 搭配 \tm{advantage\_normalizer = "std"}。为避免除以零，你还应在做除法之前把 \tm{advantage\_eps} 加到每组的标准差上。
+
+\medskip
+\noindent\textbf{问题（\tm{compute\_group\_normalized\_rewards\_grpo}）：组归一化（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}实现一个方法 \tm{compute\_group\_normalized\_rewards}，它在各组内部对原始奖励做归一化，并返回归一化后的奖励以及任何你认为有用的元数据。
+
+目前你只需要支持 \tm{baseline = "mean"} 和 \tm{advantage\_normalizer = "std"}。对于不支持输入，直接抛出 \tm{NotImplementedError} 即可。在作业后面的部分，我们会实现其他选项并进行消融实验。记住要在归一化分母上加上 \tm{advantage\_eps}，以避免除以零。
+
+% ==================== 原文第 18 页 ====================
+推荐使用如下接口：
+
+\begin{lstlisting}
+def compute_group_normalized_rewards(
+       raw_rewards: torch.Tensor,
+       group_size: int,
+       baseline: Literal["mean", "none"] = "mean",
+       advantage_eps: float = 1e-6,
+       advantage_normalizer: Literal["std", "none", "mean"] = "std",
+
+):
+\end{lstlisting}
+
+通过在每组内部应用指定的基线（baseline）和归一化方式来计算优势。
+
+参数：
+
+\begin{itemize}
+  \item \tm{raw\_rewards: torch.Tensor} 形状为 \tm{(rollout\_batch\_size,)}。每条 rollout 回答的未归一化奖励，其中 \tm{rollout\_batch\_size = n\_prompts\_per\_rollout\_batch * group\_size}。
+  \item \tm{group\_size: int} 每个问题（组）对应的回答数量。
+  \item \tm{baseline: Literal["mean", "none"]} 本题只需支持 \tm{mean}，即减去组内平均奖励。之后 \tm{none} 将表示不做基线扣减。
+  \item \tm{advantage\_eps: float} 一个小常数，用于避免归一化时除以零。
+  \item \tm{advantage\_normalizer: Literal["std", "none", "mean"]} 本题只需支持 \tm{std}，即除以组内标准差。之后 \tm{none} 将表示不做归一化，\tm{mean} 将表示除以组内平均奖励。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{tuple[torch.Tensor, dict[str, float]]}。
+  \begin{itemize}
+    \item \tm{advantages} 形状为 \tm{(rollout\_batch\_size,)}。每条 rollout 回答的组内归一化奖励。
+    \item \tm{metadata} 由你自行选择要记录的其他统计量（例如奖励的均值、标准差、最大/最小值）。
+  \end{itemize}
+\end{itemize}
+
+要测试你的代码，请实现 \tm{adapters.run\_compute\_group\_normalized\_rewards}。然后用 \tm{uv run pytest -k compute\_group\_normalized\_rewards\_grpo} 运行测试，确保你的实现通过测试。
+
+下一步是实现一个逐 token 计算策略梯度损失的函数。注意：算法 1 中的公式写出的是梯度估计量，而本题要求你写出一个逐 token 的损失（loss），使得对它求梯度后能得到 GRPO 梯度估计量的每一项（随后我们会在 token 维度上聚合）。这个表达式并不是传统意义上期望在训练中不断下降的损失；它只是一个表达式，使得对它取梯度时恰好得到策略梯度。
+
+你要实现的具体损失是
+\begin{equation}
+J_\theta^{\text{GRPO-on-policy}}
+= \frac{1}{BG} \sum_{i=1}^{B} \sum_{j=1}^{G} \frac{1}{\operatorname{len}\!\left(y^{(i,j)}\right)}
+\sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)}
+\frac{r\!\left(y^{(i,j)} \mid x^{(i)}\right) - \mu_i}{\operatorname{std}_i}
+\log \pi_\theta\!\left( y_t^{(i,j)} \mid x^{(i)}, y^{(i,j)}_{<t} \right),
+\end{equation}
+你可以验证，对它求微分恰好产生算法 1 中的梯度项。由于 PyTorch 优化器执行的是梯度下降，你的实现应返回该目标的相反数作为损失。\tm{compute\_policy\_gradient\_loss} 负责逐 token、逐序列地计算损失项，而 \tm{aggregate\_loss\_across\_microbatch\_sequence} 负责在 token 和序列维度上对逐 token 损失取平均。
+
+% ==================== 原文第 19 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{compute\_policy\_gradient\_loss\_on\_policy}）：在策略策略梯度（1 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}实现一个方法 \tm{compute\_policy\_gradient\_loss}，在给定原始奖励或预先计算好的优势的情况下，计算逐 token 的策略梯度损失。
+
+目前我们假设所有 rollout 都是在策略（on-policy）的，因此你只需要支持 \tm{importance\_reweighting\_method = "none"}，并且可以忽略旧对数概率（old-log-prob）和裁剪（clipping）相关的参数。对于不支持的输入，直接抛出 \tm{NotImplementedError} 即可。我们会在作业后面实现裁剪。
+
+推荐使用如下接口：
+
+\begin{lstlisting}
+def compute_policy_gradient_loss(
+       raw_rewards_or_advantages: torch.Tensor,
+       policy_log_probs: torch.Tensor,
+       importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+       old_log_probs: torch.Tensor | None = None,
+       cliprange: float | None = None,
+       response_mask: torch.Tensor | None = None,
+
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+\end{lstlisting}
+
+在每个 token 处计算策略梯度损失，其中 \tm{raw\_rewards\_or\_advantages} 既可以是原始奖励，也可以是已经归一化的优势。
+
+参数：
+
+\begin{itemize}
+  \item \tm{raw\_rewards\_or\_advantages: torch.Tensor} 形状为 \tm{(batch\_size,)} 或 \tm{(batch\_size, 1)}，每条 rollout 回答的标量奖励/优势。
+  \item \tm{policy\_log\_probs: torch.Tensor} 形状为 \tm{(batch\_size, sequence\_length)}，每个 token 的对数概率。
+  \item \tm{importance\_reweighting\_method: Literal["none", "noclip", "grpo", "gspo"]} \tm{"none"}：不做重要性重加权；\tm{"noclip"}：应用重要性重加权但不裁剪；\tm{"grpo"}：进行 PPO/GRPO 风格的 token 级重加权与裁剪；\tm{"gspo"}：进行 GSPO 风格的序列级重加权与裁剪。
+  \item \tm{old\_log\_probs: torch.Tensor | None} 除 \tm{importance\_reweighting\_method = "none"} 外必填；形状为 \tm{(batch\_size, sequence\_length)}。
+  \item \tm{cliprange: float | None = None} 裁剪参数 $\varepsilon$，当 \tm{importance\_reweighting\_method} 为 \tm{"grpo"} 或 \tm{"gspo"} 时必填。
+  \item \tm{response\_mask: torch.Tensor | None = None} 可选，形状为 \tm{(batch\_size, sequence\_length)} 的回答 token 掩码。对于只在回答 token 上平均序列级对数比率的 GSPO 实现来说是必需的。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{tuple[torch.Tensor, dict[str, torch.Tensor]]}。
+  \begin{itemize}
+    \item \tm{per\_token\_policy\_gradient\_loss} 形状为 \tm{(batch\_size, sequence\_length)}，逐 token 的策略梯度损失（将在训练循环中沿 batch 和 sequence 维度聚合）。
+    \item \tm{metadata} 来自底层损失调用的统计量，例如裁剪比例（clip fraction）的相关分量。
+  \end{itemize}
+\end{itemize}
+
+% ==================== 原文第 20 页 ====================
+要测试你的代码，请实现 \tm{adapters.run\_compute\_policy\_gradient\_loss}。然后运行 \tm{uv run pytest -k test\_compute\_policy\_gradient\_loss\_on\_policy}，确保测试通过。
+
+最后，让我们实现跨 token 和跨序列的聚合函数：标准 GRPO 的做法是先对每条序列内的 token 取平均，再对序列取平均。稍后我们会实现另一种做法——直接除以一个常数，正如推导中所见，这种做法更忠实于我们最初想要估计的策略梯度。
+
+\medskip
+\noindent\textbf{问题（\tm{aggregate\_loss\_across\_microbatch\_sequence}）：跨 token 与序列聚合损失（0.5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}实现一个方法 \tm{aggregate\_loss\_across\_microbatch}，它接收逐 token 的策略梯度损失和回答掩码，输出平均损失。目前我们使用标准 GRPO 聚合方式，即先在每条序列内部取平均、再对序列取平均，因此你可以假设 \tm{loss\_normalization = "sequence"}。对于不支持的输入，直接抛出 \tm{NotImplementedError} 即可。
+
+推荐使用如下接口：
+
+\begin{lstlisting}
+def aggregate_loss_across_microbatch(
+       per_token_policy_gradient_loss: torch.Tensor,
+       mask: torch.Tensor,
+       loss_normalization: Literal["sequence", "constant"] = "sequence",
+       normalization_constant: int | None = None,
+
+) -> torch.Tensor:
+\end{lstlisting}
+
+根据回答掩码和损失归一化策略，聚合逐 token 的策略梯度损失。
+
+参数：
+
+\begin{itemize}
+  \item \tm{per\_token\_policy\_gradient\_loss: torch.Tensor} 形状为 \tm{(batch\_size, sequence\_length)}，逐 token 的策略梯度损失（将在训练循环中沿 batch 和 sequence 维度聚合）。
+  \item \tm{mask} 形状为 \tm{(batch\_size, sequence\_length)} 的 \tm{torch.Tensor}，指示哪些位置应计入损失。
+  \item \tm{loss\_normalization: Literal["sequence", "constant"] = "sequence"} \tm{"sequence"}：先对每条序列内的损失取平均，再对序列取平均；\tm{"constant"}：用一个常数对总损失归一化。
+  \item \tm{normalization\_constant: int | None = None} 用于除总损失的常数；当 \tm{loss\_normalization = "constant"} 时必填。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{loss: torch.Tensor} 包含平均损失的标量。请确保之后可以对这个损失调用 \tm{backward}。
+\end{itemize}
+
+要测试你的代码，请实现 \tm{adapters.run\_aggregate\_loss\_across\_microbatch}。然后运行 \tm{uv run pytest -k test\_aggregate\_loss\_across\_microbatch\_sequence}，确保测试通过。
+
+% ==================== 原文第 21 页 ====================
+\subsubsection{GRPO 训练步}
+
+现在我们准备好把这些组件拼装成一个完整的训练步了。
+
+\medskip
+\noindent\textbf{梯度累积}\par\medskip
+
+为了在推理时获得良好的利用率，我们需要较大的批量大小（batch size）。于是，在训练批量大小等于推理批量大小的在策略 RL 中，GPU 没有足够的显存一次性计算整个批次的梯度。因此，我们需要把批次切分成一系列微批次（microbatch），并在这些微批次之间累积梯度。其中最主要的麻烦在于正确处理归一化，以保证微批次累积得到的梯度等价于在整个批次上计算的梯度。
+
+梯度累积在 PyTorch 中很容易实现。回忆一下，每个权重张量都有一个存储其梯度的属性 \tm{.grad}。在调用 \tm{loss.backward()} 之前，\tm{.grad} 属性为 \tm{None}；调用 \tm{loss.backward()} 之后，\tm{.grad} 属性便包含梯度。通常我们会走一步优化器，然后用 \tm{optimizer.zero\_grad()} 把梯度清零，这会重置权重张量的 \tm{.grad} 字段：
+
+\begin{lstlisting}
+# Forward pass.
+logits = model(inputs)
+loss = loss_fn(logits, labels)
+
+# Backward pass.
+loss.backward()
+
+# Update weights.
+optimizer.step()
+# Zero gradients in preparation for next iteration.
+optimizer.zero_grad()
+\end{lstlisting}
+
+要实现梯度累积，我们把批次切分成 $k$ 个微批次，并且只调用一次 \tm{optimizer.step()} 和 \tm{optimizer.zero\_grad()}。假设采用序列归一化（先对每条序列的损失取平均、再对序列取平均），那么在计算出微批次的平均损失之后，我们还需要按序列数量重新加权。
+
+\begin{lstlisting}
+gradient_accumulation_steps = 4
+microbatch_size = len(inputs) // gradient_accumulation_steps
+for i in range(0, len(inputs), microbatch_size):
+    inputs_microbatch = inputs[i:i+microbatch_size]
+    labels_microbatch = labels[i:i+microbatch_size]
+
+    # Forward pass.
+    logits = model(inputs_microbatch)
+    loss = loss_fn(logits, labels_microbatch) * (len(inputs_microbatch) / len(inputs))
+
+    # Backward pass.
+    loss.backward()
+# Update weights once across entire batch.
+optimizer.step()
+# Zero gradients once across entire batch.
+optimizer.zero_grad()
+\end{lstlisting}
+
+注意，稍后当我们改用常数归一化而不是序列归一化时，微批次代码会稍有变化，以适应不同的归一化方式。
+
+% ==================== 原文第 22 页 ====================
+\medskip
+\noindent\textbf{实现训练步}\par\medskip
+
+在下面的函数中，我们终于要实现一个 GRPO 训练步，输入是某一批 rollout。该函数接收模型、分词器、优化器、奖励函数、提示与 rollout 以及各种超参数，并负责累积梯度、走一步优化器。你需要按照上面的描述实现梯度累积，以免显存耗尽。在优化器步之前，函数还应把梯度范数裁剪到 \tm{max\_grad\_norm}。随后函数应返回该批次上的训练损失以及元数据，两者都用于日志记录。请在训练步中至少记录以下指标：
+\begin{itemize}
+  \item 损失。
+  \item 梯度范数。
+  \item token 熵。
+  \item 训练奖励（总奖励、格式奖励）。
+\end{itemize}
+你也欢迎记录其他指标：例如，记录 pass@k（$k$ 介于 1 和 \tm{group\_size} 之间，即前 $k$ 条 rollout 中至少有一条正确回答的提示所占的比例）可能会很有用。
+
+\medskip
+\noindent\textbf{问题（\tm{grpo\_train\_step\_standard\_on\_policy}）：GRPO 训练步（5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\textbf{交付要求：}在给定模型、分词器和 rollout 的情况下，实现一次策略梯度的批量更新。在作业的这一部分，你只需要针对在策略设定下的标准 GRPO 实现该函数，即 \tm{baseline = "mean"}、\tm{advantage\_normalizer = "std"}、\tm{importance\_reweighting\_method = "none"}、\tm{loss\_normalization = "sequence"}。对于不支持的输入，直接抛出 \tm{NotImplementedError} 即可。
+
+推荐使用如下接口：
+
+\begin{lstlisting}
+def grpo_train_step(
+       model: PreTrainedModel,
+       tokenizer: PreTrainedTokenizer,
+       optimizer: Optimizer,
+       gradient_accumulation_steps: int,
+       max_grad_norm: float | None,
+       reward_fn: Callable[[str, str], dict[str, float]],
+       repeated_prompts: list[str],
+       rollout_responses: list[str],
+       repeated_ground_truths: list[str],
+       group_size: int,
+       # Reward normalization
+       baseline: Literal["mean", "none"] = "mean",
+       advantage_eps: float = 1e-6,
+       advantage_normalizer: Literal["std", "none", "mean"] = "std",
+       # Importance reweighting and clipping
+       importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+       old_log_probs: torch.Tensor | None = None,
+       cliprange: float | None = None,
+       # Loss normalization
+       loss_normalization: Literal["sequence", "constant"] = "sequence",
+       normalization_constant: int | None = None,
+
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+\end{lstlisting}
+
+% ==================== 原文第 23 页 ====================
+使用 \tm{gradient\_accumulation\_steps} 个微批次执行前向与反向传播。
+
+参数：
+
+\begin{itemize}
+  \item \tm{model: PreTrainedModel} 要训练的 HuggingFace 模型。
+  \item \tm{tokenizer: PreTrainedTokenizer} 用于分词的分词器。
+  \item \tm{optimizer: Optimizer} 模型的优化器。
+  \item \tm{gradient\_accumulation\_steps: int} 每次优化器步包含的微批次数量。
+  \item \tm{max\_grad\_norm: float | None} 若不为 \tm{None}，则在调用 \tm{optimizer.step()} 之前把梯度范数裁剪到该值。
+  \item \tm{reward\_fn: Callable[[str, str], dict[str, float]]} 将 rollout 回答与标准答案对比打分，产生一个包含键 \tm{"reward"}、\tm{"format\_reward"} 和 \tm{"answer\_reward"} 的字典。
+  \item \tm{repeated\_prompts: list[str]} 各样本的提示。该列表的长度为 \tm{rollout\_batch\_size}，因为每个样本的提示会重复 \tm{group\_size} 次。
+  \item \tm{rollout\_responses: list[str]} 来自策略的 rollout。该列表的长度为 \tm{rollout\_batch\_size = n\_prompts\_per\_rollout\_batch * group\_size}。
+  \item \tm{repeated\_ground\_truths: list[str]} 各样本的标准答案。该列表的长度为 \tm{rollout\_batch\_size}，因为每个样本的标准答案会重复 \tm{group\_size} 次。
+  \item \tm{group\_size: int} 每个问题（组）对应的回答数量。
+  \item \tm{baseline: Literal["mean", "none"]} 若为 \tm{mean}，减去组内平均奖励；若为 \tm{none}，则不做任何处理。
+  \item \tm{advantage\_eps: float} 一个小常数，用于避免归一化时除以零。
+  \item \tm{advantage\_normalizer: Literal["std", "none", "mean"]} 若为 \tm{std}，除以组内标准差；若为 \tm{none}，则不做任何处理；若为 \tm{mean}，除以组内平均奖励。
+  \item \tm{importance\_reweighting\_method: Literal["none", "noclip", "grpo", "gspo"]} \tm{"none"}：不做重要性重加权；\tm{"noclip"}：应用重要性重加权但不裁剪；\tm{"grpo"}：进行 PPO/GRPO 风格的 token 级重加权与裁剪；\tm{"gspo"}：进行 GSPO 风格的序列级重加权与裁剪。
+  \item \tm{old\_log\_probs: torch.Tensor | None} 除 \tm{importance\_reweighting\_method = "none"} 外必填；形状为 \tm{(batch\_size, sequence\_length)}。
+  \item \tm{cliprange: float | None = None} 裁剪参数 $\varepsilon$，当 \tm{importance\_reweighting\_method} 为 \tm{"grpo"} 或 \tm{"gspo"} 时必填。
+  \item \tm{loss\_normalization: Literal["sequence", "constant"] = "sequence"} \tm{"sequence"}：先对每条序列内的损失取平均，再对序列取平均；\tm{"constant"}：用一个常数对总损失归一化（在整个训练过程中固定不变）。
+  \item \tm{normalization\_constant: int | None = None} 用于除总损失的常数；当 \tm{loss\_normalization = "constant"} 时必填。
+\end{itemize}
+
+返回值：
+
+\begin{itemize}
+  \item \tm{tuple[torch.Tensor, dict[str, torch.Tensor]]}。
+  \begin{itemize}
+    \item \tm{loss} 标量张量。经梯度累积调整后的批次损失。我们返回它以便记录日志。
+    \item \tm{metadata} 字典，包含来自底层损失调用的元数据、裁剪前的梯度范数，以及你可能想记录的其他统计量。
+  \end{itemize}
+\end{itemize}
+
+% ==================== 原文第 24 页 ====================
+要测试你的代码，请实现 \tm{adapters.run\_grpo\_train\_step}。然后运行 \tm{uv run pytest -k test\_grpo\_train\_step\_standard\_on\_policy}，确认测试通过。
+
+\subsection{实验}
+
+现在我们准备好搭建完整的 GRPO 训练循环了，它应当：
+\begin{itemize}
+  \item 加载模型和数据集
+  \item 初始化日志记录（例如 Wandb）、vLLM 服务器、优化器
+  \item 执行 RL 训练循环
+\end{itemize}
+
+我们在下面提供了一些推荐超参数。如果你的训练脚本正确，那么对大多数随机种子而言，使用这些超参数训练时，你应该会看到验证奖励随时间上升。
+
+\begin{lstlisting}
+n_train_examples = 6400
+n_val_examples = 1024
+num_rollout_steps = 200
+learning_rate = 1e-5
+rollout_batch_size = train_batch_size = 256
+group_size = 8
+gradient_accumulation_steps = 32
+sampling_temperature = 1.0
+sampling_max_tokens = 512
+max_grad_norm = 1.0
+optimizer = torch.optim.AdamW(
+    policy.parameters(), lr=learning_rate, betas=(0.9, 0.95), weight_decay=0.0
+)
+\end{lstlisting}
+
+注意，\tm{rollout\_batch\_size} 和 \tm{train\_batch\_size} 统计的是回答数而不是提示数。因此 \tm{rollout\_batch\_size = train\_batch\_size = 256} 意味着 32 个提示、每个提示 8 条 rollout。
+
+作为一个合理的默认设置，你可以每 10 个 rollout 批次在验证集上评估一次。由于 CoT/RL 评估噪声可能较大，请确保至少在 1024 个验证样本上评估。除了记录上一小节描述的指标之外，记录 rollout 以便定性地了解模型在做什么也很有用。一个合理的默认做法是每 40 个 rollout 批次记录一次当前 rollout 批次的训练 rollout。训练样本可以随意使用 \tm{data/gsm8k/train.jsonl}，验证样本可以使用 \tm{data/gsm8k/test.jsonl}。
+
+由于策略梯度估计量的方差可能很大，而且 RL 具有自我强化（self-reinforcing）的特性，RL 训练曲线往往有很大的方差。因此，在你确信脚本正确之后，我们会要求你用 4 个随机种子运行你的 RL 循环。即便脚本在给定随机种子时不能完全复现也没关系；你也可以直接把实验运行 4 次。在绘图时，请以某种方式展示各次运行之间的方差（即不要只画均值）。一些合理的做法包括：
+
+\begin{itemize}
+  \item 绘制 4 次运行的均值，同时把各次运行的实际曲线也直接画出来（为了可读性，可以把实际曲线放到单独一张图上，或使用更低的透明度、更细的线宽或虚线）。
+  \item 绘制均值并附带阴影置信区间：具体而言，对每一步计算样本均值和样本标准差，则一个合理的区间为 $\mu \pm 1.96 \cdot \sigma/\sqrt{n}$，其中 $n$ 为随机种子的数量。
+\end{itemize}
+
+% ==================== 原文第 25 页 ====================
+\begin{itemize}
+  \item 绘制每一步的均值以及最小值和最大值。
+\end{itemize}
+
+\medskip
+\noindent\textbf{问题（\tm{grpo\_experiments\_standard\_on\_policy}）：用 GRPO 提升 OLMo-2-0425-1B 在 GSM8K 上的性能（2 B200 小时）（10 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\begin{enumerate}[label=(\alph*)]
+  \item 编写一个脚本，在给定模型名称、提示词、训练集文件路径、验证集文件路径、采样超参数和训练超参数的情况下运行 GRPO 训练循环。从高层次看，脚本首先要初始化 vLLM 服务器、wandb 日志、数据集、模型和优化器；然后训练循环会重复以下步骤：与 vLLM 服务器同步权重、生成训练 rollout、对训练批次做策略梯度更新，并定期在验证集上检查性能（同时记录生成结果）。
+
+  \textbf{交付要求：}一个在 GSM8K 任务和 OLMo-2-0425-1B 模型上运行 GRPO（标准、在策略）的脚本。
+
+  \item 将脚本运行大约 50 步，确认验证奖励在提升，且 rollout 随时间推移看起来是合理的。注意：奖励一开始接近零是正常现象；取决于随机种子，可能需要几步之后我们才会采样到非零奖励的 rollout，模型才开始改进。
+
+  \textbf{交付要求：}能让你确信脚本正确的证据（例如：验证奖励逐步提升、rollout 看起来合理）。
+
+  \item 在确信脚本正确之后，使用上面给出的超参数、以 4 个随机种子，在 GSM8K 上运行 OLMo-2-0425-1B。你应当使用零样本（zero-shot）的 \tm{r1\_zero} 提示词。如果代码正确，你应该会看到验证奖励随训练提升。
+
+  记录以下指标，并绘制它们随时间变化的曲线，同时注明各次运行之间的方差（例如绘制各次运行的均值/标准差或最小值/最大值）：
+  \begin{itemize}
+    \item 损失。
+    \item 梯度范数。
+    \item token 熵。
+    \item 训练奖励（总奖励、格式奖励）。
+    \item 验证奖励（总奖励、格式奖励）。
+    \item 验证集平均回答长度。
+    \item 其他任何你认为有助于调试的内容。
+  \end{itemize}
+  另请定期记录 rollout 并观察它们：回答是否随着训练而改进？
+
+  \textbf{交付要求：}为每个指标写几句话的点评并附一张图，说明它在训练过程中如何变化、各次运行之间方差有多大。
+
+  \textbf{交付要求：}训练前后若干个模型 rollout 示例。
+
+  \textbf{交付要求：}一个在随机种子间取平均后、最终验证准确率不低于 25\% 的流程。
+\end{enumerate}
+
+现在我们有了一个能跑通的脚本，可以开始调超参数和做消融实验了。我们先从学习率入手，它通常是对训练影响最大的超参数。
+
+% ==================== 原文第 26 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{grpo\_learning\_rate}）：调整学习率（4 B200 小时）（3 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+从推荐超参数出发，对学习率做一次扫描（至少包含一个小于推荐默认值的学习率和一个大于推荐默认值的学习率），并汇报最终验证奖励（如果优化器发散，请注明发散）。根据你在上一部分观察到的方差大小，自行决定每次训练运行要使用多少个随机种子。在作业的其余部分，如果你愿意，可以随意使用你调好的学习率来代替推荐默认值。
+
+\textbf{交付要求：}最终验证奖励随学习率变化的曲线图，并附上几句话的点评。
+
+另一个会影响 RL 动力学的选择是提示词：由于 RL 会给模型自己的 rollout 加权，提示词能够塑造模型在训练中探索哪些 rollout。下面我们来看看提示词选择的影响。
+
+\medskip
+\noindent\textbf{问题（\tm{grpo\_prompt\_ablation}）：提示词消融（4 B200 小时）（3 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+使用 \tm{question\_only} 提示词和 \tm{r1\_zero\_three\_shot} 提示词运行 GRPO 脚本，各用几个随机种子。与上面零样本 \tm{r1\_zero} 提示词的结果相比，这些提示词表现如何？哪些提示词的平均奖励最高、方差最低？在其他记录的指标上是否还有其他系统性的差异？基于各次运行之间的方差，你对你的结论有多大把握？
+
+\textbf{交付要求：}点评文字，并为所引用的指标配图。
+
+\section{RL 算法变体}
+
+GRPO 是语言模型 RL 的流行选择，但它的算法选择在各种论文中存在争议。在本作业中，我们将学习这些选择背后的一些理论论证，并进行受控实验，亲眼看看哪些算法最好（至少对我们的模型与数据集组合而言）。本节讨论在策略（on-policy）设定，下一节讨论离策略（off-policy）算法。
+
+\subsection{Dr.\ GRPO}
+
+在推导 GRPO 的过程中，你可能已经注意到一系列选择，它们使得 GRPO 策略梯度估计量不再具有"正确"的期望 $\nabla_\theta J_\theta$，其中 $J_\theta$ 是模型的期望奖励。这两个选择分别是：标准差优势归一化，以及序列长度归一化。我们要考虑的第一个消融（在 Dr.\ GRPO 论文 [Z.\ Liu et al., 2025] 中有相关论证）就是撤销这些选择：去掉标准差归一化，并且用一个常数来除总损失，而不是先用每条序列的长度对它归一化。记这个常数归一化因子为 $Z$，则 Dr.\ GRPO 梯度估计量为
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{Z} \sum_{i=1}^{B} \sum_{j=1}^{G} \sum_{t=1}^{\operatorname{len}\!\left(y^{(i,j)}\right)}
+\left( r\!\left(y^{(i,j)} \mid x^{(i)}\right) - \mu_i \right)
+\nabla_\theta \log \pi_\theta\!\left( y_t^{(i,j)} \mid x^{(i)}, y^{(i,j)}_{<t} \right),
+\end{equation}

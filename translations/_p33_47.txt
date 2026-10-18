@@ -1,0 +1,755 @@
+     ‚Ä¢ final RMSNorm
+     ‚Ä¢ output embedding
+     ‚Ä¢ cross-entropy on logits
+
+     Deliverable: An algebraic expression for each of parameters, activations, gradients, and
+     optimizer state, as well as the total.
+(b) Instantiate your answer for a GPT-2 XL-shaped model to get an expression that only
+     depends on the batch_size. What is the maximum batch size you can use and still fit within
+     80GB memory?
+
+     Deliverable: An expression that looks like Ì†µÌ±é ‚ãÖ batch_size + Ì†µÌ±è for numerical values Ì†µÌ±é, Ì†µÌ±è, and a
+     number representing the maximum batch size.
+(c) How many FLOPs does running one step of AdamW take?
+
+     Deliverable: An algebraic expression, with a brief justification.
+(d) Model FLOPs utilization (MFU) is defined as the ratio of observed throughput (tokens per
+
+     second) relative to the hardware‚Äôs theoretical peak FLOP throughput
+     [A. Chowdhery et al., 2022]. An NVIDIA H100 GPU has a theoretical peak of 495 teraFLOP/
+     s for ‚Äúfloat32‚Äù (actually TensorFloat-32, which in reality is ‚Äúbfloat19‚Äù) operations. Assuming
+     you are able to get 50% MFU, how long would it take to train a GPT-2 XL for 400K steps
+     and a batch size of 1024 on a single H100? Following J. Kaplan et al. [25] and
+     J. Hoffmann et al. [26], assume that the backward pass has twice the FLOPs of the forward
+     pass.
+
+     Deliverable: The number of hours training would take, with a brief justification.
+
+4.4 Learning rate scheduling
+
+The value for the learning rate that leads to the quickest decrease in loss often varies during training. In
+training Transformers, it is typical to use a learning rate schedule, where we start with a bigger learning
+rate, making quicker updates in the beginning, and slowly decay it to a smaller value as the model
+trains.8 In this assignment, we will implement the cosine annealing schedule used to train LLaMA
+[H. Touvron et al., 2023].
+
+A scheduler is simply a function that takes the current step Ì†µÌ±° and other relevant parameters (such as the
+initial and final learning rates), and returns the learning rate to use for the gradient update at step Ì†µÌ±°. The
+simplest schedule is the constant function, which will return the same learning rate given any Ì†µÌ±°.
+
+The cosine annealing learning rate schedule takes (i) the current iteration Ì†µÌ±°, (ii) the maximum learning
+
+rate Ì†µÌªºmax, (iii) the minimum (final) learning rate Ì†µÌªºmin, (iv) the number of warm-up iterations Ì†µÌ±áÌ†µÌ±§, and (v)
+the final iteration of cosine annealing Ì†µÌ±áÌ†µÌ±ê. The learning rate at iteration Ì†µÌ±° is defined as:
+
+(Warm-up)  If  Ì†µÌ±°  <  Ì†µÌ±áÌ†µÌ±§,  then  Ì†µÌªºÌ†µÌ±°   =   Ì†µÌ±°     Ì†µÌªºmax  .
+                                             Ì†µÌ±áÌ†µÌ±§
+
+(Cosine  annealing)   If     Ì†µÌ±áÌ†µÌ±§  ‚â§  Ì†µÌ±°  ‚â§  Ì†µÌ±áÌ†µÌ±ê ,  then      Ì†µÌªºÌ†µÌ±°  =  Ì†µÌªºmin  +  1  (1  +  cos(   Ì†µÌ±°‚àíÌ†µÌ±áÌ†µÌ±§   Ì†µÌºã))(Ì†µÌªºmax  ‚àí  Ì†µÌªºmin).
+                                                                                  2               Ì†µÌ±áÌ†µÌ±ê‚àíÌ†µÌ±áÌ†µÌ±§
+
+(Post-annealing) If Ì†µÌ±° > Ì†µÌ±áÌ†µÌ±ê, then Ì†µÌªºÌ†µÌ±° = Ì†µÌªºmin.
+
+Problem (learning_rate_schedule): Implement cosine learning rate schedule with warmup
+(1 point)
+
+8It‚Äôs sometimes common to use a schedule where the learning rate rises back up (restarts) to help get past local minima.
+
+                                                                        33
+Write a function that takes Ì†µÌ±°, Ì†µÌªºmax, Ì†µÌªºmin, Ì†µÌ±áÌ†µÌ±§ and Ì†µÌ±áÌ†µÌ±ê, and returns the learning rate Ì†µÌªºÌ†µÌ±° according to
+the scheduler defined above. Then implement [adapters.get_lr_cosine_schedule] and make sure
+
+it passes uv run pytest -k test_get_lr_cosine_schedule.
+
+4.5 Gradient clipping
+
+During training, we can sometimes hit training examples that yield large gradients, which can destabilize
+training. To mitigate this, one technique often employed in practice is gradient clipping. The idea is to
+enforce a limit on the norm of the gradient after each backward pass before taking an optimizer step.
+
+Given the gradient (for all parameters) Ì†µÌ±î, we compute its ‚Ñì2-norm ‚ÄñÌ†µÌ±î‚Äñ2. If this norm is less than a
+
+maximum  value  Ì†µÌ±Ä ,  then  we  leave  Ì†µÌ±î  as  is;  otherwise,  we  scale  Ì†µÌ±î  down  by  a  factor  of     Ì†µÌ±Ä      (where  a  small
+                                                                                                        ‚ÄñÌ†µÌ±î‚Äñ2 +Ì†µÌºÄ
+Ì†µÌºÄ, like 10‚àí6, is added for numeric stability). Note that the resulting norm will be just under Ì†µÌ±Ä .
+
+Problem (gradient_clipping): Implement gradient clipping (1 point)
+
+Write a function that implements gradient clipping. Your function should take a list of parameters
+and a maximum ‚Ñì2-norm. It should modify each parameter gradient in place. Use Ì†µÌºÄ = 10‚àí6 (the
+PyTorch default). Then, implement the adapter [adapters.run_gradient_clipping] and make sure
+
+it passes uv run pytest -k test_gradient_clipping.
+
+5 Training loop
+
+We will now finally put together the major components we‚Äôve built so far: the tokenized data, the model,
+and the optimizer.
+
+5.1 Data Loader
+
+The tokenized data (e.g., that you prepared in tokenizer_experiments) is a single sequence of tokens Ì†µÌ±• =
+(Ì†µÌ±•1, ‚Ä¶, Ì†µÌ±•Ì†µÌ±õ). Even though the source data might consist of separate documents (e.g., different web pages,
+or source code files), a common practice is to concatenate all of those into a single sequence of tokens,
+adding a delimiter between them (such as the <|endoftext|> token).
+A data loader turns this into a stream of batches, where each batch consists of Ì†µÌ∞µ sequences of length Ì†µÌ±ö,
+paired with the corresponding next tokens, also with length Ì†µÌ±ö. For example, for Ì†µÌ∞µ = 1, Ì†µÌ±ö = 3,
+([Ì†µÌ±•2, Ì†µÌ±•3, Ì†µÌ±•4], [Ì†µÌ±•3, Ì†µÌ±•4, Ì†µÌ±•5]) would be one potential batch.
+Loading data in this way simplifies training for a number of reasons. First, any 1 ‚â§ Ì†µÌ±ñ ‚â§ Ì†µÌ±õ ‚àí Ì†µÌ±ö gives a
+valid training sequence, so sampling training sequences is trivial. Since all training sequences have the
+same length, there‚Äôs no need to pad input sequences, which improves hardware utilization (also by
+increasing batch size Ì†µÌ∞µ). Finally, we also don‚Äôt need to load the full dataset to sample training data,
+making it easy to handle large datasets that might not otherwise fit in memory.
+
+  Problem (data_loading): Implement data loading (2 points)
+
+     Deliverable: Write a function that takes a numpy array Ì†µÌ±• (integer array with token IDs), a
+     batch_size, a context_length and a PyTorch device string (e.g., 'cpu' or 'cuda:0'), and returns
+     a pair of tensors: the sampled input sequences and the corresponding next-token targets. Both
+
+                                                                     34
+     tensors should have shape (batch_size, context_length) containing token IDs, and both should
+     be placed on the requested device. To test your implementation against our provided tests, you
+     will first need to implement the test adapter at [adapters.run_get_batch] . Then, run uv run
+     pytest -k test_get_batch to test your implementation.
+
+       Low-Resource Tip: Data loading on CPU or Apple Silicon
+
+          If you are planning to train your LM on CPU or Apple Silicon, you need to move your
+          data to the correct device (and similarly, you should use the same device for your model
+          later on).
+          If you are on CPU, you can use the 'cpu' device string, and on Apple Silicon (M* chips),
+          you can use the 'mps' device string.
+          For more on MPS, check out these resources:
+          ‚Ä¢ https://docs.pytorch.org/docs/stable/mps.html
+          ‚Ä¢ https://docs.pytorch.org/docs/stable/notes/mps.html
+          ‚Ä¢ https://developer.apple.com/documentation/metalperformanceshaders
+
+What if the dataset is too big to load into memory? We can use a Unix system call named mmap which
+maps a file on disk to virtual memory, and lazily loads the file contents when that memory location is
+accessed. Thus, you can ‚Äúpretend‚Äù you have the entire dataset in memory. Numpy implements this
+through np.memmap (or the flag mmap_mode='r' to np.load, if you originally saved the array with np.save),
+which will return a numpy array-like object that loads the entries on-demand as you access them. When
+sampling from your dataset (i.e., a numpy array) during training, be sure to load the
+dataset in memory-mapped mode (via np.memmap or the flag mmap_mode='r' to np.load, depending on
+how you saved the array). Make sure you also specify a dtype that matches the array that you‚Äôre loading.
+It may be helpful to explicitly verify that the memory-mapped data looks correct (e.g., doesn‚Äôt contain
+values beyond the expected vocabulary size).
+
+5.2 Checkpointing
+
+In addition to loading data, we will also need to save models as we train. When running jobs, we often
+want to be able to resume a training run that stopped midway through (e.g., due to your job timing out,
+machine failure, etc). Even when all goes well, we might also want to later have access to intermediate
+models (e.g., to study training dynamics post-hoc, take samples from models at different stages of
+training, etc).
+A checkpoint should have all the states that we need to resume training. We of course want to be able to
+restore model weights at a minimum. If using a stateful optimizer (such as AdamW), we will also need to
+save the optimizer‚Äôs state (e.g., in the case of AdamW, the moment estimates). Finally, to resume the
+learning rate schedule, we will need to know the iteration number we stopped at. PyTorch makes it easy
+to save all of these: every nn.Module has a state_dict() method that returns a dictionary with all
+learnable weights; we can restore these weights later with the sister method load_state_dict(). The same
+goes for any torch.optim.Optimizer. Finally, torch.save(obj, dest) can dump an object (e.g., a
+dictionary containing tensors as some values, but also regular Python objects like integers) to a file (path)
+or file-like object, which can then be loaded back into memory with torch.load(src).
+
+                                                                     35
+  Problem (checkpointing): Implement model checkpointing (1 point)
+
+     Implement the following two functions to load and save checkpoints:
+     def save_checkpoint(model, optimizer, iteration, out) should dump all the state from the
+
+         model, optimizer and iteration into the file-like object out. You can use the state_dict
+         method of both the model and the optimizer to get their relevant states and use
+         torch.save(obj, out) to dump obj into out (PyTorch supports either a path or a file-like
+         object here). A typical choice is to have obj be a dictionary, but you can use whatever format
+         you want as long as you can load your checkpoint later.
+     This function expects the following parameters:
+
+        model: torch.nn.Module
+        optimizer: torch.optim.Optimizer
+        iteration: int
+        out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+
+     def load_checkpoint(src, model, optimizer) should load a checkpoint from src (path or file-like
+         object), and then recover the model and optimizer states from that checkpoint. Your function
+         should return the iteration number that was saved to the checkpoint. You can use
+         torch.load(src) to recover what you saved in your save_checkpoint implementation, and the
+         load_state_dict method in both the model and optimizer to return them to their previous
+         states.
+
+     This function expects the following parameters:
+
+        src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes]
+        model: torch.nn.Module
+        optimizer: torch.optim.Optimizer
+
+     Implement the [adapters.run_save_checkpoint] and [adapters.run_load_checkpoint] adapters,
+     and make sure they pass uv run pytest -k test_checkpointing.
+
+5.3 Training loop
+
+Now, it‚Äôs finally time to put all of the components you implemented together into your main training
+script. It will pay off to make it easy to start training runs with different hyperparameters (e.g., by taking
+them as command-line arguments), since you will be doing these many times later to study how different
+choices impact training.
+
+  Problem (training_together): Put it together (4 points)
+
+     Deliverable: Write a script that runs a training loop to train your model on user-provided input.
+     In particular, we recommend that your training script allow for (at least) the following:
+     ‚Ä¢ Ability to configure and control the various model and optimizer hyperparameters.
+     ‚Ä¢ Memory-efficient loading of large training and validation datasets with np.memmap.
+     ‚Ä¢ Serializing checkpoints to a user-provided path.
+
+                                                                     36
+‚Ä¢ Periodically logging training and validation performance (e.g., to console and/or an external
+   service like Weights and Biases).9
+
+6 Generating text
+
+Now that we can train models, the last piece we need is the ability to generate text from our model.
+Recall that a language model takes in a (possibly batched) integer sequence of length sequence_length
+and produces a matrix of size (sequence_length, vocab_size), where each element of the sequence is a
+probability distribution predicting the next token after that position. We will now write a few functions
+to turn this into a sampling scheme for new sequences.
+
+Softmax
+
+By standard convention, the language model output is the output of the final linear layer (the ‚Äúlogits‚Äù)
+and so we have to turn this into a normalized probability via the softmax operation, which we saw earlier
+in Equation 10.
+
+Decoding
+
+To generate text (decode) from our model, we will provide the model with a sequence of prefix tokens
+(the ‚Äúprompt‚Äù), and ask it to produce a probability distribution over the vocabulary that predicts the
+next token in the sequence. Then, we will sample from this distribution over the vocabulary items to
+determine the next output token.
+
+Concretely, one step of the decoding process should take in a sequence Ì†µÌ±•1‚Ä¶Ì†µÌ±° and return a token Ì†µÌ±•Ì†µÌ±°+1 via
+the following equation,
+
+Ì†µÌ±É (Ì†µÌ±•Ì†µÌ±°+1         =  Ì†µÌ±ñ  |  Ì†µÌ±•1‚Ä¶Ì†µÌ±°)  =  exp(Ì†µÌ±£Ì†µÌ±ñ)                                                           (21)
+                                                                                                             (22)
+                                         ‚àë       exp(Ì†µÌ±£Ì†µÌ±ó)
+
+                                             Ì†µÌ±ó
+
+                             Ì†µÌ±£       =  TransformerLM(Ì†µÌ±•1‚Ä¶Ì†µÌ±°                        )    ‚àà     ‚Ñùvocab_size
+
+                                                                                      Ì†µÌ±°
+
+where TransformerLM is our model which takes as input a sequence of length sequence_length and
+produces a matrix of size (sequence_length, vocab_size), and we take the last element of this matrix, as
+we are looking for the next token prediction at the Ì†µÌ±°-th position.
+
+This gives us a basic decoder by repeatedly sampling from these one-step conditionals (appending our
+previously-generated output token to the input of the next decoding timestep) until we generate the end-
+of-sequence token <|endoftext|> (or a user-specified maximum number of tokens to generate).
+
+Decoder tricks
+
+We will be experimenting with small models, and small models can sometimes generate very low-quality
+texts. Two simple decoder tricks can help fix these issues. First, in temperature scaling we modify our
+softmax with a temperature parameter Ì†µÌºè , where the new softmax is
+
+                   softmax(Ì†µÌ±£, Ì†µÌºè )Ì†µÌ±ñ    =                            exp(Ì†µÌ±£Ì†µÌ±ñ/Ì†µÌºè )          .               (23)
+
+                                                 ‚àëvocab_size          exp(Ì†µÌ±£Ì†µÌ±ó/Ì†µÌºè         )
+
+                                                     Ì†µÌ±ó=1
+
+Note how setting Ì†µÌºè ‚Üí 0 makes it so that the largest element of Ì†µÌ±£ dominates, and the output of the
+softmax becomes a one-hot vector concentrated at this maximal element.
+
+9wandb.ai
+
+                                                                  37
+Second, another trick is nucleus or top-p sampling, where we modify the sampling distribution by
+truncating low-probability tokens. Let Ì†µÌ±û be a probability distribution that we get from a (temperature-
+scaled) softmax of size vocab_size. Nucleus sampling with hyperparameter Ì†µÌ±ù produces the next token
+according to the equation
+
+                                                                             Ì†µÌ±ûÌ†µÌ±ñ                             if  Ì†µÌ±ñ ‚àà Ì†µÌ±â (Ì†µÌ±ù)
+
+                                              Ì†µÌ±É (Ì†µÌ±•Ì†µÌ±°+1  = Ì†µÌ±ñ  |  Ì†µÌ±û) = { ‚àë                      (Ì†µÌ±ù)  Ì†µÌ±ûÌ†µÌ±ó                                              (24)
+                                                                                           Ì†µÌ±ó‚ààÌ†µÌ±â
+
+                                                                         0                                    otherwise
+
+where  Ì†µÌ±â  (Ì†µÌ±ù)  is  the  smal lest  set  of  indices     such     that  ‚àë                        Ì†µÌ±ûÌ†µÌ±ó        ‚â•   Ì†µÌ±ù.  You  can  compute  this  quantity  easily
+
+                                                                             Ì†µÌ±ó‚ààÌ†µÌ±â (Ì†µÌ±ù)
+
+by first sorting the probability distribution Ì†µÌ±û by magnitude, and selecting the largest vocabulary elements
+
+until you reach the target level of Ì†µÌ±ù.
+
+Problem (decoding): Decoding (3 points)
+
+Deliverable: Implement a function to decode from your language model. We recommend that
+you support the following features:
+
+‚Ä¢ Generate completions for a user-provided prompt (i.e., take in some Ì†µÌ±•1‚Ä¶Ì†µÌ±° and sample a
+   completion until you hit an <|endoftext|> token).
+
+‚Ä¢ Allow the user to control the maximum number of generated tokens.
+
+‚Ä¢ Given a desired temperature value, apply softmax temperature scaling to the predicted next-
+   token distributions before sampling.
+
+‚Ä¢ Top-Ì†µÌ±ù sampling ([A. Holtzman et al., 2020] also referred to as nucleus sampling), given a user-
+   specified threshold value.
+
+7 Experiments
+
+Now it is time to put everything together and train (small) language models on a pretraining dataset.
+
+7.1 How to Run Experiments and Deliverables
+
+The best way to understand the rationale behind the architectural components of a Transformer is to
+actually modify it and run it yourself. There is no substitute for hands-on experience.
+To this end, it‚Äôs important to be able to experiment quickly, consistently, and keep records of what
+you did. To experiment quickly, we will be running many experiments on a small-scale model (about 17M
+total parameters) and simple dataset (TinyStories). To do things consistently, you will ablate components
+and vary hyperparameters in a systematic way, and to keep records we will ask you to submit a log of
+your experiments and learning curves associated with each experiment.
+To make it possible to submit loss curves, make sure to periodically evaluate validation losses and
+record both the number of steps and wall-clock times. You might find logging infrastructure such
+as Weights and Biases helpful.
+
+  Problem (experiment_log): Experiment logging (3 points)
+
+     For your training and evaluation code, create experiment tracking infrastructure that allows you
+     to track your experiments and loss curves with respect to gradient steps and wall-clock time.
+
+                                                                         38
+Deliverable: Logging infrastructure code for your experiments and an experiment log (a
+document of all the things you tried) for the assignment problems below in this section.
+
+7.2 TinyStories
+
+We are going to start with a very simple dataset (TinyStories; R. Eldan et al. [1]) where models will train
+quickly, and we can see some interesting behaviors. The instructions for getting this dataset are in
+Section 1. An example of what this dataset looks like is below.
+
+Example (tinystories_example): One example from TinyStories
+
+   Once upon a time there was a little boy named Ben. Ben loved to explore the world around him.
+   He saw many amazing things, like beautiful vases that were on display in a store. One day, Ben
+   was walking through the store when he came across a very special vase. When Ben saw it he was
+   amazed! He said, ‚ÄúWow, that is a really amazing vase! Can I buy it?‚Äù The shopkeeper smiled and
+   said, ‚ÄúOf course you can. You can take it home and show all your friends how amazing it is!‚Äù So
+   Ben took the vase home and he was so proud of it! He called his friends over and showed them
+   the amazing vase. All his friends thought the vase was beautiful and couldn‚Äôt believe how lucky
+   Ben was. And that‚Äôs how Ben found an amazing vase in the store!
+
+7.2.1 Hyperparameter tuning
+
+We will tell you some very basic hyperparameters to start with and ask you to find some settings for
+others that work well.
+
+Vocab size 10000. Typical vocabulary sizes are in the tens to hundreds of thousands. You should vary
+this and see how the vocabulary and model behavior change.
+
+Context length 256. Simple datasets such as TinyStories might not need long sequence lengths, but for
+the later OpenWebText data, you may want to vary this. Try varying this and seeing the impact on both
+the per-iteration runtime and the final perplexity.
+
+d_model 512. This is slightly smaller than the 768 dimensions used in many small Transformer papers, but
+this will make things faster.
+
+d_ff  1344.  This  is  roughly  8  Ì†µÌ±ëmodel  while  being  a  multiple  of  64,  which  is  good  for  GPU  performance.
+                                3
+
+RoPE theta parameter Œò 10000.
+
+Number of layers and heads 4 layers, 16 heads. Together, this will give about 17M non-embedding
+parameters which is a fairly small Transformer.
+
+Total tokens processed 327,680,000 (your batch size √ó total step count √ó context length should equal
+roughly this value).
+
+You should do some trial and error to find good defaults for the following other hyperparameters:
+
+learning rate, learning rate warmup, other AdamW hyperparameters (Ì†µÌªΩ1, Ì†µÌªΩ2, Ì†µÌºÄ), and weight decay. You
+can find some typical choices of such hyperparameters in D. P. Kingma et al. [22].
+
+7.2.2 Putting it together
+
+Now you can put everything together by getting a trained BPE tokenizer, tokenizing the training dataset,
+and running this in the training loop that you wrote. Important note: If your implementation is correct
+and efficient, the above hyperparameters should result in a roughly 20‚Äì30 minute runtime on 1 B200
+
+                                                             39
+GPU. If you have runtimes that are much longer, please check and make sure your dataloading,
+checkpointing, or validation loss code is not bottlenecking your runtimes and that your implementation is
+properly batched.
+
+7.2.3 Tips and tricks for debugging model architectures
+We highly recommend getting comfortable with your IDE‚Äôs built-in debugger (e.g., VSCode/Zed), which
+will save you time compared to debugging with print statements. If you use a text editor, you can use
+something like ipdb. A few other good practices when debugging model architectures are:
+‚Ä¢ A common first step when developing any neural net architecture is to overfit to a single minibatch. If
+
+   your implementation is correct, you should be able to quickly drive the training loss to near-zero.
+‚Ä¢ Set debug breakpoints in various model components, and inspect the shapes of intermediate tensors to
+
+   make sure they match your expectations.
+‚Ä¢ Monitor the norms of activations, model weights, and gradients to make sure they are not exploding or
+
+   vanishing.
+
+  Problem (learning_rate): Tune the learning rate (2 B200 hrs) (3 points)
+
+     The learning rate is one of the most important hyperparameters to tune. Taking the base model
+     you‚Äôve trained, answer the following questions:
+     (a) Perform a hyperparameter sweep over the learning rates and report the final losses (or note
+
+          divergence if the optimizer diverges).
+          Deliverable: Learning curves associated with multiple learning rates. Explain your
+          hyperparameter search strategy.
+          Deliverable: A model with validation loss (per-token) on TinyStories of at most 1.45
+
+            Low-Resource Tip: Train for a few steps on CPU or Apple Silicon
+
+               If you are running on cpu or mps, you should instead reduce the total tokens processed
+               count to 40, 000, 000, which will be sufficient to produce reasonably fluent text. You
+               may also increase the target validation loss from 1.45 to 2.00.
+               Running our solution code with a tuned learning rate on an M4 Max chip and 36 GB
+               of RAM, we use batch size √ó total step count √ó context length = 32 √ó 5000 √ó 256 =
+               40, 960, 000 tokens, which takes 1 hour and 22 minutes on cpu and 36 minutes on mps.
+               At step 5000, we achieve a validation loss of 1.80.
+               Some additional tips:
+               ‚Ä¢ When using Ì†µÌ±Å training steps, we suggest adjusting the cosine learning rate decay
+
+                   schedule to terminate its decay (i.e., reach the minimum learning rate) at precisely
+                   step Ì†µÌ±Å .
+               ‚Ä¢ When using mps, do not use TF32 kernels, i.e., do not set
+
+                               torch.set_float32_matmul_precision('high')
+
+                   as you might with cuda devices. We tried enabling TF32 kernels with mps (torch
+                   version 2.9.0) and found the backend sometimes uses silently broken kernels that
+                   cause unstable training.
+
+                                                                     40
+               ‚Ä¢ You can speed up training by JIT-compiling your model with torch.compile.
+                   Specifically:
+                   ‚Ä£ On cpu, compile your model with
+
+                                   model = torch.compile(model)
+
+                   ‚Ä£ On mps, you can somewhat optimize the backward pass using
+
+                                   model = torch.compile(model, backend="aot_eager")
+
+                      Compilation with Inductor is not supported on mps as of torch version 2.9.0.
+
+     (b) Folk wisdom is that the best learning rate is ‚Äúat the edge of stability.‚Äù Investigate how the
+          point at which learning rates diverge is related to your best learning rate.
+          Deliverable: Learning curves of increasing learning rate which include at least one divergent
+          run and an analysis of how this relates to convergence rates.
+
+Now let‚Äôs vary the batch size and see what happens to training. Batch sizes are important ‚Äì they let us
+get higher efficiency from our GPUs by doing larger matrix multiplies, but is it true that we always want
+batch sizes to be large? Let‚Äôs run some experiments to find out.
+
+  Problem (batch_size_experiment): Batch size variations (1 B200 hr) (1 point)
+
+     Vary your batch size all the way from 1 to the GPU memory limit. Try at least a few batch sizes
+     in between, including typical sizes like 64 and 128.
+     Deliverable: Learning curves for runs with different batch sizes. The learning rates should be
+     optimized again if necessary.
+     Deliverable: A few sentences discussing your findings on batch sizes and their impacts on
+     training.
+
+With your decoder in hand, we can now generate text! We will generate from the model and see how
+good it is. As a reference, you should get outputs that look at least as good as the example below.
+
+  Example (ts_generate_example): Sample output from a TinyStories language model
+
+     Once upon a time, there was a pretty girl named Lily. She loved to eat gum, especially the big
+     black one. One day, Lily‚Äôs mom asked her to help cook dinner. Lily was so excited! She loved to
+     help her mom. Lily‚Äôs mom made a big pot of soup for dinner. Lily was so happy and said, ‚ÄúThank
+     you, Mommy! I love you.‚Äù She helped her mom pour the soup into a big bowl. After dinner, Lily‚Äôs
+     mom made some yummy soup. Lily loved it! She said, ‚ÄúThank you, Mommy! This soup is so
+     yummy!‚Äù Her mom smiled and said, ‚ÄúI‚Äôm glad you like it, Lily.‚Äù They finished cooking and
+     continued to cook together. The end.
+
+  Low-Resource Tip: Generate text on CPU or Apple Silicon
+
+                                                                     41
+     If instead you used the low-resource configuration with 40M tokens processed, you should see
+     generations that still resemble English but are not as fluent as above. For example, our sample
+     output from a TinyStories language model trained on 40M tokens is below:
+
+     Once upon a time, there was a little girl named Sue. Sue had a tooth that she loved very much. It
+     was his best head. One day, Sue went for a walk and met a ladybug! They became good friends
+     and played on the path together.
+     ‚ÄúHey, Polly! Let‚Äôs go out!‚Äù said Tim. Sue looked at the sky and saw that it was difficult to find a
+     way to dance shining. She smiled and agreed to help the talking!‚Äú
+     As Sue watched the sky moved, what it was. She
+
+Here is the precise problem statement and what we ask for:
+
+  Problem (generate): Generate text (1 point)
+
+     Using your decoder and your trained checkpoint, report the text generated by your model. You
+     may need to manipulate decoder parameters (temperature, top-p, etc.) to get fluent outputs.
+     Deliverable: Text dump of at least 256 tokens of text (or until the first <|endoftext|> token),
+     and a brief comment on the fluency of this output and at least two factors which affect how good
+     or bad this output is.
+
+7.3 Ablations and architecture modification
+
+The best way to understand the Transformer is to actually modify it and see how it behaves. We will now
+do a few simple ablations and modifications.
+
+Ablation 1: layer normalization
+It is often said that layer normalization is important for the stability of Transformer training. But
+perhaps we want to live dangerously. Let‚Äôs remove RMSNorm from each of our Transformer blocks and
+see what happens.
+
+Problem (layer_norm_ablation): Remove RMSNorm and train (0.5 B200 hrs) (1 point)
+
+Remove all of the RMSNorms from your Transformer and train. What happens at the previous
+optimal learning rate? Can you get stability by using a lower learning rate?
+
+Deliverable: A learning curve for when you remove RMSNorms and train, as well as a learning
+curve for the best learning rate.
+
+Deliverable: A few sentences of commentary on the impact of RMSNorm.
+
+Let‚Äôs now investigate another layer normalization choice that seems arbitrary at first glance. Pre-norm
+Transformer blocks are defined as
+
+Ì†µÌ±ß = Ì†µÌ±• + MultiHeadSelfAttention(RMSNorm(Ì†µÌ±•))                                                             (25)
+
+Ì†µÌ±¶ = Ì†µÌ±ß + FFN(RMSNorm(Ì†µÌ±ß)).                                                                               (26)
+
+42
+This is one of the few ‚Äòconsensus‚Äô modifications to the original Transformer architecture, which used a
+post-norm approach as
+
+                                  Ì†µÌ±ß = RMSNorm(Ì†µÌ±• + MultiHeadSelfAttention(Ì†µÌ±•))                                                   (27)
+
+                                  Ì†µÌ±¶ = RMSNorm(Ì†µÌ±ß + FFN(Ì†µÌ±ß)).                                                                     (28)
+
+Let‚Äôs revert back to the post-norm approach and see what happens.
+
+Problem (pre_norm_ablation): Implement post-norm and train (0.5 B200 hrs) (1 point)
+
+    Modify your pre-norm Transformer implementation into a post-norm one. Train with the post-
+    norm model and see what happens.
+
+    Deliverable: A learning curve for a post-norm Transformer, compared to the pre-norm one.
+
+We see that layer normalization has a major impact on the behavior of the Transformer, and that even
+the position of the layer normalization is important.
+
+Ablation 2: position embeddings
+
+We will next investigate the impact of the position embeddings on the performance of the model.
+Specifically, we will compare our base model (with RoPE) with not including position embeddings at all
+(NoPE). It turns out that decoder-only transformers, i.e., those with a causal mask as we have
+implemented, can in theory infer relative or absolute position information without being provided with
+position embeddings explicitly [Y.-H. H. Tsai et al., 2019; A. Kazemnejad et al., 2023]. We will now test
+empirically how NoPE performs compared to RoPE.
+
+Problem (no_pos_emb): Implement NoPE (0.5 B200 hrs) (1 point)
+
+    Modify your Transformer implementation with RoPE to remove the position embedding
+    information entirely, and see what happens.
+
+    Deliverable: A learning curve comparing the performance of RoPE and NoPE.
+
+Ablation 3: SwiGLU vs. SiLU
+
+Next, we will follow N. Shazeer [20] and test the importance of gating in the feed-forward network, by
+comparing the performance of SwiGLU feed-forward networks versus feed-forward networks using SiLU
+activations but no gated linear unit (GLU):
+
+                                          FFNSiLU(Ì†µÌ±•) = Ì†µÌ±ä2 SiLU(Ì†µÌ±ä1Ì†µÌ±•).                                                          (29)
+
+Recall that in our SwiGLU implementation, we set the dimensionality of the inner feed-forward layer to
+
+be  roughly  Ì†µÌ±ëff  =  8  Ì†µÌ±ëmodel  (while  ensuring  that  Ì†µÌ±ëff  mod 64  =  0,  to  make  use  of  GPU  tensor  cores).  In  this
+                      3
+
+ablation baseline, your FFNSiLU implementation should instead set Ì†µÌ±ëff = 4 √ó Ì†µÌ±ëmodel, to approximately
+
+match the parameter count of the default SwiGLU feed-forward network (which has three instead of two
+
+weight matrices).
+
+Problem (swiglu_ablation): SwiGLU vs. SiLU (0.5 B200 hrs) (1 point)
+
+                                                                43
+     Deliverable: A learning curve comparing the performance of SwiGLU and SiLU feed-forward
+     networks, with approximately matched parameter counts.
+     Deliverable: A few sentences discussing your findings.
+
+  Low-Resource Tip: Online students with limited GPU resources should test modifications
+  on TinyStories
+
+     In the remainder of the assignment, we will move to a larger-scale, noisier web dataset
+     (OpenWebText), experimenting with architecture modifications and (optionally) making a
+     submission to the course leaderboard.
+     It takes a long time to train an LM to fluency on OpenWebText, so we suggest that online
+     students with limited GPU access continue testing modifications on TinyStories (using validation
+     loss as a metric to evaluate performance).
+
+7.4 Running on OpenWebText
+
+We will now move to a more standard pretraining dataset created from a web crawl. A small sample of
+OpenWebText [A. Gokaslan et al., 2019] is also provided as a single text file: see Section 1 for how to
+access this file.
+Here is an example from OpenWebText. Note how the text is much more realistic, complex, and varied.
+You may want to look through the training dataset to get a sense of what training data looks like for a
+web-scraped corpus.
+
+  Example (owt_example): One example from OWT
+
+     Baseball Prospectus director of technology Harry Pavlidis took a risk when he hired Jonathan
+     Judge.
+     Pavlidis knew that, as Alan Schwarz wrote in The Numbers Game, ‚Äúno corner of American
+     culture is more precisely counted, more passionately quantified, than performances of baseball
+     players.‚Äù With a few clicks here and there, you can find out that Noah Syndergaard‚Äôs fastball
+     revolves more than 2,100 times per minute on its way to the plate, that Nelson Cruz had the
+     game‚Äôs highest average exit velocity among qualified hitters in 2016 and myriad other tidbits that
+     seem ripped from a video game or science fiction novel. The rising ocean of data has empowered
+     an increasingly important actor in baseball‚Äôs culture: the analytical hobbyist.
+     That empowerment comes with added scrutiny ‚Äì on the measurements, but also on the people
+     and publications behind them. With Baseball Prospectus, Pavlidis knew all about the backlash
+     that accompanies quantitative imperfection. He also knew the site‚Äôs catching metrics needed to be
+     reworked, and that it would take a learned mind ‚Äì someone who could tackle complex statistical
+     modeling problems ‚Äì to complete the job.
+     ‚ÄúHe freaks us out.‚Äù Harry Pavlidis
+     Pavlidis had a hunch that Judge ‚Äúgot it‚Äù based on the latter‚Äôs writing and their interaction at a
+     site-sponsored ballpark event. [‚Ä¶]
+
+                                                                     44
+Note: You may have to re-tune your hyperparameters such as learning rate or batch size for this
+experiment.
+
+  Problem (main_experiment): Experiment on OWT (2 B200 hrs) (2 points)
+
+     Train your language model on OpenWebText with the same model architecture and total training
+     iterations as TinyStories. How well does this model do?
+     Deliverable: A learning curve of your language model on OpenWebText. Describe the difference
+     in losses from TinyStories ‚Äì how should we interpret these losses?
+     Deliverable: Generated text from OpenWebText LM, in the same format as the TinyStories
+     outputs. How is the fluency of this text? Why is the output quality worse even though we have
+     the same model and compute budget as TinyStories?
+
+7.5 Your own modification + leaderboard
+
+Congratulations on getting to this point. You‚Äôre almost done! You will now try to improve upon the
+Transformer architecture, and see how your hyperparameters and architecture stack up against other
+students in the class.
+Rules for the leaderboard
+There are no restrictions other than the following:
+Runtime: Your submission can run for at most 45 minutes on a B200. You might want to enforce this in
+
+    your submission script if you use either SLURM or Modal.
+Data: You may only use the OpenWebText training dataset that we provide.
+Otherwise, you are free to do whatever your heart desires.
+If you are looking for some ideas on what to implement, you can check out some of these resources:
+‚Ä¢ State-of-the-art open-source LLM families, such as Llama 3 [A. Grattafiori et al., 2024] or Qwen 2.5
+
+   [A. Yang et al., 2024].
+‚Ä¢ The NanoGPT speedrun repository (github.com/KellerJordan/modded-nanogpt), where community
+
+   members post many interesting modifications for ‚Äúspeedrunning‚Äù small-scale language model
+   pretraining. For example, a common modification that dates back to the original Transformer paper is
+   to tie the weights of the input and output embeddings together (see A. Vaswani et al. [8] (Section 3.4)
+   and A. Chowdhery et al. [16] (Section 2)). If you do try weight tying, you may have to decrease the
+   standard deviation of the embedding/LM head init.
+You will want to test these on either a small subset of OpenWebText or on TinyStories before trying the
+full 45-minute run.
+As a caveat, we do note that some of the modifications you may find working well in this leaderboard
+may not generalize to larger-scale pretraining. We will explore this idea further in the scaling laws unit of
+the course.
+
+  Problem (leaderboard): Leaderboard (10 B200 hrs) (6 points)
+
+                                                                     45
+     You will train a model under the leaderboard rules above with the goal of minimizing the
+     validation loss of your language model within 0.75 B200-hours.
+     Deliverable: The final validation loss that was recorded, an associated learning curve that clearly
+     shows a wall-clock-time x-axis that is less than 45 minutes, and a description of what you did. We
+     expect a leaderboard submission to beat at least the naive baseline of a 5.0 loss. Submit to the
+     leaderboard here: github.com/stanford-cs336/assignment1-basics-leaderboard.
+
+Bibliography
+
+[1] R. Eldan and Y. Li, ‚ÄúTinyStories: How Small Can Language Models Be and Still Speak Coherent
+      English?.‚Äù 2023.
+
+[2] A. Gokaslan, V. Cohen, E. Pavlick, and S. Tellex, ‚ÄúOpenWebText corpus.‚Äù 2019.
+[3] R. Sennrich, B. Haddow, and A. Birch, ‚ÄúNeural Machine Translation of Rare Words with Subword
+
+      Units,‚Äù in Proc. of ACL, 2016.
+[4] C. Wang, K. Cho, and J. Gu, ‚ÄúNeural Machine Translation with Byte-Level Subwords.‚Äù 2019.
+[5] P. Gage, ‚ÄúA new algorithm for data compression,‚Äù C Users Journal, vol. 12, no. 2, pp. 23‚Äì38, Feb.
+
+      1994.
+[6] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, and I. Sutskever, ‚ÄúLanguage Models are
+
+      Unsupervised Multitask Learners.‚Äù 2019.
+[7] A. Radford, K. Narasimhan, T. Salimans, and I. Sutskever, ‚ÄúImproving Language Understanding by
+
+      Generative Pre-Training.‚Äù 2018.
+[8] A. Vaswani et al., ‚ÄúAttention is All you Need,‚Äù in Proc. of NeurIPS, 2017.
+[9] T. Q. Nguyen and J. Salazar, ‚ÄúTransformers without Tears: Improving the Normalization of Self-
+
+      Attention,‚Äù in Proc. of IWSWLT, 2019.
+[10] R. Xiong et al., ‚ÄúOn Layer Normalization in the Transformer Architecture,‚Äù in Proc. of ICML,
+
+      2020.
+[11] J. L. Ba, J. R. Kiros, and G. E. Hinton, ‚ÄúLayer Normalization.‚Äù 2016.
+[12] H. Touvron et al., ‚ÄúLLaMA: Open and Efficient Foundation Language Models.‚Äù 2023.
+[13] B. Zhang and R. Sennrich, ‚ÄúRoot Mean Square Layer Normalization,‚Äù in Proc. of NeurIPS, 2019.
+[14] A. Grattafiori et al., ‚ÄúThe Llama 3 Herd of Models.‚Äù [Online]. Available:
+
+      https://arxiv.org/abs/2407.21783
+[15] A. Yang et al., ‚ÄúQwen2.5 Technical Report,‚Äù arXiv preprint arXiv:2412.15115, 2024.
+[16] A. Chowdhery et al., ‚ÄúPaLM: Scaling Language Modeling with Pathways.‚Äù 2022.
+[17] D. Hendrycks and K. Gimpel, ‚ÄúBridging Nonlinearities and Stochastic Regularizers with Gaussian
+
+      Error Linear Units.‚Äù 2016.
+[18] S. Elfwing, E. Uchibe, and K. Doya, ‚ÄúSigmoid-Weighted Linear Units for Neural Network Function
+
+      Approximation in Reinforcement Learning.‚Äù [Online]. Available: https://arxiv.org/abs/1702.03118
+[19] Y. N. Dauphin, A. Fan, M. Auli, and D. Grangier, ‚ÄúLanguage Modeling with Gated Convolutional
+
+      Networks.‚Äù [Online]. Available: https://arxiv.org/abs/1612.08083
+[20] N. Shazeer, ‚ÄúGLU Variants Improve Transformer.‚Äù 2020.
+
+                                                                     46
+[21] J. Su, Y. Lu, S. Pan, B. Wen, and Y. Liu, ‚ÄúRoFormer: Enhanced Transformer with Rotary Position
+      Embedding.‚Äù 2021.
+
+[22] D. P. Kingma and J. Ba, ‚ÄúAdam: A Method for Stochastic Optimization,‚Äù in Proc. of ICLR, 2015.
+[23] I. Loshchilov and F. Hutter, ‚ÄúDecoupled Weight Decay Regularization,‚Äù in Proc. of ICLR, 2019.
+[24] T. B. Brown et al., ‚ÄúLanguage Models are Few-Shot Learners,‚Äù in Proc. of NeurIPS, 2020.
+[25] J. Kaplan et al., ‚ÄúScaling Laws for Neural Language Models.‚Äù 2020.
+[26] J. Hoffmann et al., ‚ÄúTraining Compute-Optimal Large Language Models.‚Äù 2022.
+[27] A. Holtzman, J. Buys, L. Du, M. Forbes, and Y. Choi, ‚ÄúThe Curious Case of Neural Text
+
+      Degeneration,‚Äù in Proc. of ICLR, 2020.
+[28] Y.-H. H. Tsai, S. Bai, M. Yamada, L.-P. Morency, and R. Salakhutdinov, ‚ÄúTransformer Dissection:
+
+      An Unified Understanding for Transformer`s Attention via the Lens of Kernel,‚Äù in Proceedings of the
+      2019 Conference on Empirical Methods in Natural Language Processing and the 9th International
+      Joint Conference on Natural Language Processing (EMNLP-IJCNLP), K. Inui, J. Jiang, V. Ng, and
+      X. Wan, Eds., Hong Kong, China: Association for Computational Linguistics, Nov. 2019, pp. 4344‚Äì
+      4353. doi: 10.18653/v1/D19-1443.
+[29] A. Kazemnejad, I. Padhi, K. Natesan, P. Das, and S. Reddy, ‚ÄúThe Impact of Positional Encoding on
+      Length Generalization in Transformers,‚Äù in Thirty-seventh Conference on Neural Information
+      Processing Systems, 2023. [Online]. Available: https://openreview.net/forum?id=Drrl2gcjzl
+
+                                                                     47
+

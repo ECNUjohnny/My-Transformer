@@ -1,0 +1,65 @@
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs,longtable,tabularx,array,multirow}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage[colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!55!black,citecolor=blue!55!black]{hyperref}
+\hypersetup{pdftitle={CS336 作业 5：对齐（中文翻译）},pdfauthor={Stanford CS336（中文翻译）},pdfsubject={CS336 作业说明中文翻译},pdfcreator={Z.ai}}
+
+\captionsetup{font=small}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{black!35},
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=4
+}
+\setlength{\parskip}{5pt}
+\graphicspath{{figures/}}
+\makeatletter
+\let\tm@oDot.
+\let\tm@oSlash/
+\let\tm@oDash-
+\let\tm@oComma,
+\let\tm@oUs\_
+\begingroup
+  \catcode`\_=13 \catcode`\.=13 \catcode`\/=13 \catcode`\-=13 \catcode`\,=13 \relax
+  \gdef\tm@actdefs{\def_{\tm@oUs\allowbreak}\def.{\tm@oDot\allowbreak}\def/{\tm@oSlash\allowbreak}\def-{\tm@oDash\allowbreak}\def,{\tm@oComma\allowbreak}}
+\endgroup
+\newcommand{\tm@brk}[1]{%
+  \begingroup%
+  \catcode`\_=13 \catcode`\.=13 \catcode`\/=13 \catcode`\-=13 \catcode`\,=13 \relax%
+  \def\_{\tm@oUs\allowbreak}%
+  \tm@actdefs%
+  \endlinechar=-1%
+  \scantokens{#1}%
+  \endgroup}
+\newcommand{\tm@fmt}[2]{\ifmmode\mbox{{#1\tm@brk{#2}}}\else{{#1\tm@brk{#2}}}\fi}
+\renewcommand{\texttt}[1]{\tm@fmt{\ttfamily}{#1}}
+\newcommand{\tm}[1]{\tm@fmt{\small\ttfamily}{#1}}
+\makeatother
+\emergencystretch=3em
+
+\title{\textbf{CS336 作业 5：对齐（Alignment）}}
+\author{原文：Stanford CS336 作业说明（英文原版）}
+\date{}
+
+\begin{document}
+\maketitle
+\begin{center}\small
+本文档为英文原版作业说明的非官方中文翻译，仅供学习参考；如与原文有歧义，请以英文原文为准。
+\end{center}
+\tableofcontents
+\clearpage
+\input{part1}
+\input{part2}
+\input{part3}
+\end{document}

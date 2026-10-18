@@ -1,0 +1,481 @@
+% ==================================================================
+% part1.tex —— 对应原文第 1–13 页
+% ==================================================================
+% ==================== 原文第 1 页 ====================
+
+\section{作业概览}
+
+在本作业中，你将获得一些动手经验：训练一个语言模型进行推理（reasoning）并解决下游任务。
+
+\noindent\textbf{你将实现的内容}
+
+\begin{enumerate}
+  \item 零样本（zero-shot）、少样本（few-shot）与思维链（chain-of-thought）提示。
+  \item 组相对策略优化（Group Relative Policy Optimization，GRPO），一种强化学习算法，用于在给定外部奖励的情况下提升模型性能。
+  \item 策略梯度估计的若干变体，以探索方差缩减与重要性权重裁剪（importance weight clipping）策略。
+\end{enumerate}
+
+\noindent\textbf{你将运行的内容}
+
+\begin{enumerate}
+  \item 在 GSM8K 上测量 OLMo-2-0425-1B 的提示（prompting）性能。
+  \item 在 OLMo-2-0425-1B 上运行在策略（on-policy）GRPO，以提升其在 GSM8K 上的性能。
+  \item 运行多种 RL 变体，包括 RFT、Dr.\ GRPO 与 MaxRL，以探索 RL 中的算法选择。
+  \item 运行离策略（off-policy）GRPO，以加速训练并探索各种裁剪策略。
+\end{enumerate}
+
+\noindent\textbf{代码仓库的结构}
+
+{\sloppy 作业的全部代码以及本说明文档都可以在 GitHub 上获取：\url{https://github.com/stanford-cs336/assignment5-alignment}。请 \tm{git clone} 该仓库。如果有任何更新，我们会通知你，你可以通过 \tm{git pull} 获取最新版本。\par}
+
+\begin{enumerate}
+  \item \tm{cs336\_alignment/*}：这里是你编写作业 5 代码的地方。注意这里没有任何现成代码（除了下文所述的起始代码之外），所以你应当可以从零开始自由实现。
+  \item \tm{cs336\_alignment/vllm\_utils.py}：该文件包含启动一个能生成文本并同步权重的 vLLM 服务器的代码。
+  \item \tm{cs336\_alignment/drgrpo\_grader.py}：该文件包含为数学题的模型输出评分的代码。
+  \item \tm{cs336\_alignment/prompts/*}：为方便起见，我们提供了若干包含提示（prompt）的文本文件。
+  \item \tm{tests/*.py}：该目录包含必做的 GRPO 测试以及可选的对齐/安全补充（alignment/safety supplement）测试。
+\end{enumerate}
+
+\tm{tests/test\_grpo.py} 中的必做测试会调用 \tm{tests/adapters.py} 中定义的钩子（hook）。你需要实现这些适配器（adapter），把你的代码接入测试。多写一些测试和/或修改测试代码对调试你的代码很有帮助，但你的实现需要通过最初提供的测试套件。
+
+\begin{enumerate}
+  \item \tm{README.md}：该文件包含一些搭建环境的基本说明。
+\end{enumerate}
+
+\noindent\textbf{如何提交}
+
+你需要向 Gradescope 提交以下文件：
+
+% ==================== 原文第 2 页 ====================
+\begin{itemize}
+  \item \tm{writeup.pdf}：回答所有书面问题。请对你撰写的回答进行排版。
+  \item \tm{code.zip}：包含你写的全部代码。
+\end{itemize}
+
+运行 \tm{test\_and\_make\_submission.sh} 中的脚本即可生成 \tm{code.zip} 文件。
+
+\section{引言}
+
+\subsection{背景}
+
+在本课程的前四次作业中，我们学习了如何预训练一个基础模型（base model）。现在我们准备学习后训练（post-training）：一旦我们有了基础模型，如何把它变成一个能解决下游任务的有用工具？
+
+后训练的一个组成部分是对齐（alignment）。预训练由于其数据混合（data mixture）与训练目标，会让模型具备广泛的知识与行为。但当我们要求模型解决任务时，我们想要的是一种特定行为，即做一个有帮助且无害的助手。把一个宽泛的基础模型改造成一个专注的对话模型（chat model）的过程称为“指令微调（instruction tuning）”或“对齐（alignment）”，我们将在可选的作业 5 补充材料（Assignment 5 supplement）中介绍这些技术。
+
+后训练的另一个组成部分是强化学习（reinforcement learning）。在预训练中，由于我们的目标是让模型具备广泛的知识基础，我们使用广泛的数据（网络上的文本）。而在后训练 RL 中，我们的目标变窄了：我们希望模型在某个特定任务上达到很高的准确率，比如解数学题。这一更窄的目标与预训练至少有两点不同：(a) 我们不再拥有那么多数据；(b) 我们的训练目标从“覆盖”（拥有广泛的知识基础）变成了“精准”（产生准确的回答）。由于这些差异，我们需要一种新的技术，即强化学习（RL）。
+
+在 RL 中，我们会得到一个由问题组成的数据集，以及一个判断某个回答是否正确解决问题的评分函数。例如，在编程场景中，我们可能拿到一道编程题（例如“写一个反转列表的 Python 函数”），以及一个由一组测试用例构成的评分函数（例如 \tm{assert f([0, 1, 2]) == [2, 1, 0]}）。又如在数学场景中，我们可能拿到一道数学推理应用题（例如“如果四年前 Tom 的年龄是 John 的一半，而 John 现在二十岁，Tom 现在多大？”），以及一个解析最终答案并检查其是否正确（12）的评分函数。值得注意的是，与预训练不同，我们并没有拿到可供模仿的回答数据集：在编程的例子中，我们没有拿到解决该任务的正确 Python 程序；在数学推理的例子中，我们没有拿到能得出答案的正确推理链。相反，在 RL 中，我们直接以模型准确率作为目标函数来做梯度步。从高层次来看，RL 包括：从模型采样回答、用评分函数给它们打分，然后上调那些正确回答的权重。
+
+在本作业中，我们将从数学和实验两个角度学习 RL。事实证明 RL 很难：它又慢又不稳定。为 RL 做科学也很难：RL 实验在不同随机种子之间方差很大，而且实现中看似微小的细节影响巨大。本作业将介绍 LLM RL，并探索其中的一些挑战。
+
+\subsection{模型与数据集}
+
+本作业将使用 \href{https://huggingface.co/allenai/OLMo-2-0425-1B}{OLMo-2-0425-1B}，一个在 \href{https://huggingface.co/datasets/allenai/olmo-mix-1124}{OLMo-mix-1124} 上预训练、并在 \href{https://huggingface.co/datasets/allenai/dolmino-mix-1124}{Dolmino-mix-1124} 上做中期训练（mid-trained）的基础模型，总共使用了 4 万亿（4 trillion）个 token。OLMo-mix-1124 主要由 DCLM-Baseline [J.\ Li et al., 2024] 组成（我们在课上讲过这个数据集），而 Dolmino-mix-1124 是一个更聚焦的数据混合，大约由 50\% 的 DCLM 数据和 50\% 的指令跟随、数学、代码、STEM 论文以及 wiki 数据组成。OLMo-2-0425-1B 的其他细节可参阅 OLMo 2 技术报告 [T.\ OLMo et al., 2024]。学到课程的这个阶段，你应当已经具备理解他们每一个设计决策所需的全部背景知识。
+
+% ==================== 原文第 3 页 ====================
+作为下游任务，我们将使用 GSM8K 数据集 [K.\ Cobbe et al., 2021]，它可以在作业仓库的 \tm{data/gsm8k/train.jsonl} 和 \tm{data/gsm8k/test.jsonl} 找到，也可以在\href{https://huggingface.co/datasets/openai/gsm8k}{此处}在线获取。该数据集包含一组难度较低的小学数学推理应用题。下面是一个例子：
+
+\begin{lstlisting}
+{
+  "question": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?",
+  "answer": "Natalia sold 48/2 = <<48/2=24>>24 clips in May.\nNatalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.\n#### 72"
+}
+\end{lstlisting}
+
+在 RL 过程中，我们的模型将学会为这类题目生成推理链，从而提升其解决数学问题的能力。
+
+\noindent\textbf{关于模型与数据集选择的说明：}受资源所限，我们只选择了一个小规模的“模型-数据集”组合来充当我们的 RL 测试床（testbed）。具体而言，我们选择的这个小模型相当能干，因为它在极大量的 token 上训练过（是参数量的 4000 倍！），这让我们能够在一个真实数据集上、以小规模看到合理的 RL 结果。遗憾的是，我们在这门课上训练的模型太弱，解不了数学题。如果你在完成本作业后还有兴趣，也欢迎把你在这门课上训练的模型拿到一个更简单的任务上跑 RL。由于 RL 的训练动态非常依赖于具体的模型和数据集，请记住：我们在本作业中看到的结果未必能迁移到其他“模型-数据集”组合上。
+
+\subsection{记号}
+
+本作业会涉及一些数学，因此我们在下表中给出后面会用到的部分记号。语言建模与强化学习常常对同一个对象使用不同的术语，所以表中同时列出了两种术语。如果你忘了某个记号指的是什么，可以随时回到这张表。
+
+\begin{longtable}{@{}lp{2.8cm}p{3.0cm}p{5.6cm}@{}}
+\toprule
+记号 & 语言建模术语 & 强化学习术语 & 含义 \\
+\midrule
+\endhead
+$\rho$ & 提示分布（prompt distribution）或数据集 & 初始状态分布（initial state distribution） & 提示/问题上的一个分布。 \\
+$x$ & 提示；问题（prompt; question） & 初始状态（initial state） & 从 $\rho$ 中采样出的提示/问题。 \\
+$y$ & 回答；补全；生成；样本（response; completion; generation; sample） & rollout；轨迹（trajectory）；采样的动作序列 & 对提示 $x$ 采样出的一个回答。 \\
+$y_t$ & token & 动作（action） & $y$ 中第 $t$ 个生成的 token。 \\
+$y_{<t}$ & 前缀（prefix） & & 位置 $t$ 之前所有已生成的 token，即 $y_1, \dots, y_{t-1}$。 \\
+$\pi_\theta$ & 模型（model） & 策略（policy） & 参数为 $\theta$ 的模型，它在给定提示 $x$ 的条件下为回答 $y$ 分配概率 $\pi_\theta(y \mid x)$。 \\
+$\pi_\theta(y_t \mid x, y_{<t})$ & 下一 token 分布（next-token distribution） & 时间步 $t$ 处的策略（policy at timestep $t$） & 在给定提示与之前已生成 token 的条件下，token $y_t$ 的条件概率。 \\
+$r(y \mid x)$ & & 奖励（reward） & 表示采样回答正确与否的标量分数（本作业中为 0 或 1）。 \\
+$B$ & 每批的提示数（number of prompts per batch） & & 每个推理批次（inference batch）中的提示数量。 \\
+$G$ & 每个提示的生成数（generations per prompt） & 组大小（group size） & 为每个提示采样的回答数量。 \\
+$\operatorname{len}(y)$ 或 $L$ & 回答长度（response length） & 视界（horizon） & 一条回答中生成的 token 数量。 \\
+$A^{(i,j)}$ & & 优势（advantage） & 经过基线（baseline）减除与归一化之后，分配给提示 $i$ 的回答 $j$ 的权重。 \\
+\bottomrule
+\end{longtable}
+
+% ==================== 原文第 4 页 ====================
+\section{提示}
+
+我们将预训练基础模型应用于下游任务的第一步是对它进行提示。基础模型在预训练时见过各种各样的行为，而提示是一种轻量级的方式，可以把模型的行为引导到解题模式上。在本作业的后半部分，我们还会看到提示的选择会影响 RL 的动态与探索。
+
+给模型提示的最基本方式是只提供问题，然后从模型的下一 token 分布中采样来产生答案；我们把这种策略称为 \tm{question\_only}。我们将把这种策略与 \tm{r1\_zero} 提示进行比较，后者既包含问题，也包含让模型进行思维链（chain-of-thought）推理的指令 [DeepSeek-AI et al., 2025]。
+
+\subsection{使用 vLLM 进行推理}
+
+要从模型生成回答，我们需要一个推理引擎。实现一个推理引擎超出了本作业的范围，因此我们将使用 vLLM 推理引擎 [W.\ Kwon et al., 2023]，它实现了多种优化，包括快速的 CUDA kernel、用于高效注意力 KV 缓存的 PagedAttention 等等。启动 vLLM 服务器并生成文本的代码已在 \tm{cs336\_alignment/vllm\_utils.py} 中提供，其接口如下：
+
+\begin{lstlisting}
+@dataclass
+class VLLMCompletion:
+    text: str
+    token_ids: list[int]
+    finish_reason: str | None
+
+@dataclass
+class VLLMServer:
+    model_id: str
+    gpu: int = 0
+    seed: int = 0
+    gpu_memory_utilization: float = 0.9
+\end{lstlisting}
+
+% ==================== 原文第 5 页 ====================
+% （接上一页代码清单的结尾）
+\begin{lstlisting}
+    def start(self) -> None: ...
+
+    def generate_completions(
+        self,
+        prompts: list[str],
+        sampling_params: dict,
+        batch_size: int | None = None,
+    ) -> list[VLLMCompletion]: ...
+\end{lstlisting}
+
+\subsection{零样本、少样本与思维链提示}
+
+除非另有说明，在 GSM8K 上的实验我们将使用来自 DeepSeek R1-Zero 模型 [DeepSeek-AI et al., 2025] 的如下提示。我们将其称为 \tm{r1\_zero} 提示：
+
+\begin{lstlisting}
+A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and the answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
+User: {question}
+Assistant: <think>
+\end{lstlisting}
+
+\tm{r1\_zero} 提示位于文本文件 \tm{cs336\_alignment/prompts/r1\_zero.prompt} 中。
+
+在提示中，\tm{question} 指我们插入的某个问题（例如 “Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?”）。我们的期望是：模型扮演助手（assistant）的角色，开始生成思考过程（因为我们已经预先放入了起始的 \tm{<think>} 标签），用 \tm{</think>} 结束思考过程，然后在 answer 标签内生成一个最终的符号答案，例如 \tm{<answer> 4x + 10 </answer>}。让模型生成 \tm{<answer> </answer>} 这类标签的目的是：这样我们就能方便地解析模型的输出并与标准答案（ground truth）比较，并且当我们看到结束标签 \tm{</answer>} 时，可以停止生成回答。
+
+另一种提示方法称为少样本提示（few-shot prompting），即在把实际问题喂给模型之前，先在前面附上若干问答对。\tm{r1\_zero} 提示的少样本版本形如：
+
+\begin{lstlisting}
+A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and the answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>.
+User: {question-1}
+Assistant: <think> {reasoning-1} </think> <answer> {answer-1} </answer>
+User: {question-2}
+Assistant: <think> {reasoning-2} </think> <answer> {answer-2} </answer>
+User: {question-3}
+Assistant: <think> {reasoning-3} </think> <answer> {answer-3} </answer>
+User: {question}
+Assistant: <think>
+\end{lstlisting}
+
+% ==================== 原文第 6 页 ====================
+少样本提示通过给模型提供几个它要解决的任务示例来提升模型的性能。开放基础模型报告的基准测试数字往往是少样本的：例如，OLMo-2-0425-1B 模型卡上报告的 GSM8K 结果就使用了 8-shot 提示。我们在 \tm{cs336\_alignment/prompts/r1\_zero\_three\_shot\_gsm8k.prompt} 中包含了 \tm{r1\_zero} 提示的 3-shot 版本，其中的示例取自 \href{https://github.com/allenai/olmes/blob/main/oe_eval/tasks/fewshot_sources.py#L2247}{OLMES 仓库}。
+
+{\sloppy 最后，作为基线，我们将加入 \tm{question\_only} 提示，见 \tm{cs336\_alignment/prompts/\allowbreak question\_only.prompt}：\par}
+
+\begin{lstlisting}
+{question} Please put your final answer within \\boxed{{}}.
+\end{lstlisting}
+
+注意，虽然这个提示名叫 \tm{question\_only}，我们仍要求把最终答案放进 \tm{\textbackslash boxed\{\}} 中，以便评分器更容易从回答中解析出答案，这将在下一节讨论。
+
+\subsection{评分函数}
+
+模型生成回答之后，我们需要检查它是否正确。我们的数学题带有标准答案（例如 0.5），但模型可能以多种方式给出正确答案：例如，它可以回答 \tm{<answer> 1/2 </answer>}，或者回答 \tm{The answer is 0.5.}。因此，为了恰当地给模型输出评分，我们需要一个答案解析函数，它以模型输出和一个已知的标准答案为输入，返回一个布尔值，表明模型输出是否正确。
+
+{\sloppy 在我们的实验中，我们将使用一个快速且相当准确的答案解析器，它来自最近关于推理 RL 的工作 [Z.\ Liu et al., 2025]。对于 \tm{r1\_zero} 提示，该奖励函数实现在 \tm{cs336\_alignment.drgrpo\_grader.r1\_zero\_reward\_fn}。\tm{question\_only} 提示并不要求模型使用 \tm{<think>} 和 \tm{<answer>} 标签，因此应当改用同一个评分文件中的 \tm{cs336\_alignment.drgrpo\_grader.question\_only\_reward\_fn} 来评估。注意，\tm{question\_only} 解析器会在 \tm{\textbackslash boxed\{\}} 中寻找最终答案。这些奖励函数返回一个总奖励（total reward），以及单独的格式奖励（format reward）和答案奖励（answer reward），分别表明回答是否符合预期格式、解析出的答案是否正确。一些工作会对格式正确但答案错误的回答给部分分数（即非零的总奖励）。在我们的实验中，我们不给部分分数，因此总奖励就等于答案奖励，格式奖励只用于日志记录。\par}
+
+注意，这些奖励函数期望 \tm{ground\_truth} 参数只包含答案。GSM8K 数据集中的标准答案形如 \tm{\{rationale\} \#\#\#\# \{answer\}}，要从中提取答案，你应当在 \tm{\#\#\#\#} 处分割并去除空白字符。
+
+\subsection{实验}
+
+现在我们准备评估基础模型的提示性能了。
+
+\noindent\textbf{生成超参数。}生成回答时，我们将以 temperature 1.0、top-p 1.0、最大生成长度 512 进行采样。\tm{r1\_zero} 系列提示要求模型以字符串 \tm{</answer>} 结束它的答案，因此在使用这些提示时，我们可以指示 vLLM 在模型输出该字符串时停止：
+
+\begin{lstlisting}
+# Based on Dr. GRPO: stop when the model completes its answer
+# https://github.com/sail-sg/understand-r1-zero/blob/
+#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167
+sampling_params['stop'] = ["</answer>"]
+sampling_params['include_stop_str_in_output'] = True
+\end{lstlisting}
+
+只对 \tm{r1\_zero} 和 \tm{r1\_zero\_three\_shot} 提示使用这个停止字符串，不要对 \tm{question\_only} 提示使用。
+
+% ==================== 原文第 7 页 ====================
+\medskip
+\noindent\textbf{问题（\tm{prompting\_baselines}）：在 GSM8K 上运行 OLMo-2-0425-1B（5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+\begin{enumerate}[label=(\alph*)]
+  \item 编写一个脚本，用零样本 \tm{question\_only}、零样本 \tm{r1\_zero} 和少样本 \tm{r1\_zero\_three\_shot} 三种提示评估 OLMo-2-0425-1B 在 GSM8K 上的性能。
+
+  然后，运行你的脚本并观察输出。对每种提示，模型生成中有多少落入以下各个类别：(1) 正确，且格式奖励与正确性奖励均为 1；(2) 格式奖励为 1、正确性奖励为 0；(3) 格式奖励为 0、正确性奖励为 0？观察至少十个类别 2 的例子，其中有多少模型输出实际上正确、只是没有被正确解析？类别 3 又如何？
+
+  \textbf{交付要求：}几句话的评论、评估指标，以及若干提示与回答的例子。
+
+  \item 观察模型输出，刻画每种提示下模型的行为。例如，如果我们想让模型回答问题，只提供问题就够了吗？还是说模型在回答问题之外还表现出其他行为？零样本 \tm{r1\_zero} 和少样本 \tm{r1\_zero\_three\_shot} 提示是如何塑造模型行为的？
+
+  \textbf{交付要求：}几句话的评论，并附上支持性例子。
+\end{enumerate}
+
+\section{组相对策略优化}
+
+我们已经用纯提示的方式测量了模型性能，下一步将通过训练来提升性能。具体来说，我们想优化模型的准确率，或者等价地，它的期望奖励：
+\begin{equation}
+J_\theta = \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)],
+\end{equation}
+其中 $\rho$ 是提示/问题 $x$ 上的任务分布，$\pi_\theta$ 是我们的模型，$y$ 是对 $x$ 采样出的回答/解答，$r(y \mid x)$ 表示 $y$ 是否是 $x$ 的正确答案（我们也把 $r$ 称为“奖励函数”）。注意，这个目标与课程到目前为止研究的预训练目标大不相同：交叉熵损失 $\mathbb{E}_{x\sim\mathcal{D}}[-\log \pi_\theta(x)]$ 从数据集 $\mathcal{D}$ 中抽取样本，而我们的准确率目标涉及对来自模型本身的样本求期望。因此，我们需要新的工具来优化这个目标：特别地，我们需要使用强化学习（RL）。从高层次来看，RL 包括：从模型采样回答、用评分函数给它们打分，并强化那些正确的回答。RL 通常又慢又充满挑战，所以本作业的很大一部分将探索让 RL 更快、更稳定的工具。
+
+RL 的另一个方面是：由于它涉及从模型采样，其动态会受到采样时所使用提示的影响。具体而言，语言模型研究中一个令人兴奋的发现是：当使用思维链推理提示时，对一个强基础模型做 RL 可以大幅提升其推理能力 [OpenAI et al., 2024; DeepSeek-AI et al., 2025]。因此，在本作业中，除了探索 RL 的核心算法思想之外，我们还将探索 RL 与思维链提示等语言建模技术的相互作用。
+
+\subsection{推导在策略 GRPO}
+
+我们将首先探究 RL 背后的数学，一步步引出组相对策略优化（GRPO）算法——训练语言模型时常用的一种 RL 算法 [Z.\ Shao et al., 2024]。我们的讲述紧贴两份更深入讲解这些概念的优秀资料：OpenAI 的 \textit{Spinning Up in Deep RL} [J.\ Achiam, 2018] 与 Nathan Lambert 的 \textit{Reinforcement Learning from Human Feedback (RLHF) Book} [N.\ Lambert, 2024]。
+
+% ==================== 原文第 8 页 ====================
+\subsubsection{将语言模型视为策略}
+
+在传统的强化学习中，我们考虑一个策略（policy），它接收状态（state）$s_t$ 并输出动作（action）$a_t$。这个动作随后产生某个奖励 $r_t = r(s_t, a_t)$，以及一个从某个下一状态分布中抽出的后续状态 $s_{t+1} \sim \text{next\_state}(s_t, a_t)$。强化学习就是优化策略以获得高奖励。
+
+带参数 $\theta$ 的因果语言模型（LM）$\pi_\theta$ 定义了在给定当前文本前缀 $y_{<t} = (y_1, \dots, y_{t-1})$ 的条件下下一个 token $y_t$ 的概率分布。所以在 RL 的语境下，我们可以把下一个 token $y_t$ 看作我们的动作 $a_t$，把当前文本前缀 $y_{<t}$ 看作状态 $s_t$。因此，LM 是一个类别型（categorical）随机策略
+\begin{equation}
+a_t \sim \pi_\theta(\cdot \mid s_t), \qquad \pi_\theta(a_t \mid s_t) = [\operatorname{softmax}(f_\theta(s_t))]_{a_t}.
+\end{equation}
+
+在用策略梯度优化策略时，我们需要两个基本操作：
+
+\begin{enumerate}
+  \item \textit{从策略采样}：从上述类别分布中抽取一个动作 $a_t$；
+  \item \textit{给动作的对数似然打分}：计算 $\log \pi_\theta(a_t \mid s_t)$。
+\end{enumerate}
+
+一般地，用 LLM 做 RL 时，$s_t$ 是目前生成的部分补全/解答，每个 $a_t$ 是解答的下一个 token；当模型输出一个文本结束（end-of-text）token 时，回合结束，比如 \tm{<|end\_of\_text|>}，或者在我们的 \tm{r1\_zero} 提示的情形下是 \tm{</answer>}。
+
+\subsubsection{轨迹}
+
+在强化学习中，我们从某个起始分布抽出的初始状态 $s_0 \sim \rho$ 出发。然后我们从策略 $\pi_\theta$ 采样一个动作 $a_t$，按照某个下一状态分布转移到下一个状态 $s_{t+1} \sim \text{next\_state}(s_t, a_t)$，并不断重复。这一系列状态和动作就构成一条（有限视界的）轨迹（trajectory）：
+\begin{equation}
+\tau = (s_0, a_0, s_1, a_1, \dots, s_T, a_T),
+\end{equation}
+其中 $T$ 是轨迹的长度，也就是说，$a_T$ 是一个文本结束 token，或者我们已经达到按 token 计的最大生成预算。
+
+在我们的情形中，$s_0 \sim \rho$ 就是包含我们想解的数学题的提示 $x$（可能附带了 CoT 提示或少样本示例）。从这个前缀出发，我们逐个采样 token，下一个状态是旧前缀拼接上新采样出的 token，即 $s_{t+1} = (s_t, a_t)$。轨迹也被称为回合（episode）或 rollout；我们将交替使用这些术语。
+
+\subsubsection{奖励与回报}
+
+在 RL 中，标量奖励 $r_t = r(s_t, a_t)$ 评判在状态 $s_t$ 所采取动作的直接质量。对于可验证（verified）领域上的 RL，比如我们的数学应用题任务，中间推理步骤的奖励为零，直到我们输出答案。然后，我们在终止动作上收到一个经验证的奖励（verified reward）
+\begin{equation}
+r_T = r(s_T, a_T) :=
+\begin{cases}
+1 & \text{若轨迹 $\tau$ 依我们的奖励函数与标准答案吻合} \\
+0 & \text{否则}
+\end{cases}
+\end{equation}
+在我们的情形中，如果最终答案正确，则 $r_T$ 为 1，否则为 0。回报（return）$R(\tau)$ 把轨迹沿途的奖励汇总起来，在我们的情形中就是 $r_T$。
+
+% ==================== 原文第 9 页 ====================
+智能体的目标是最大化期望回报
+\begin{equation}
+J_\theta = \mathbb{E}_{\tau\sim\pi_\theta}[r(\tau)],
+\end{equation}
+其中 $\tau\sim\pi_\theta$ 表示轨迹的分布：我们先采样 $s_0 \sim \rho$，然后从策略采样动作、从下一状态分布采样下一状态。在我们的情形中，这意味着先从数据集采样数学题 $x \sim \rho$，然后逐 token 采样直到到达回答末尾，这个过程可以记作 $y \sim \pi_\theta(y \mid x)$。该目标引出如下优化问题
+\begin{equation}
+\theta^* = \arg\max_\theta J_\theta.
+\end{equation}
+
+\subsubsection{策略梯度}
+
+现在我们有了学习一种称为策略梯度（policy gradients）的 RL 算法所需的记号和定义。在作业余下的部分，我们将坚持使用语言模型记号 $(x, y)$ 来表示提示与回答，而不是状态 $s_t$ 与动作 $a_t$ 的 RL 记号。
+
+回忆一下，我们想优化模型的期望奖励（即准确率），由下式给出
+\begin{equation}
+J_\theta = \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)],
+\end{equation}
+其中 $r(y \mid x)$ 表示回答 $y$ 对提示 $x$ 是否正确。我们的做法是对该目标做梯度上升，即
+\begin{equation}
+\theta_{k+1} = \theta_k + \alpha \nabla_\theta J_{\theta_k},
+\end{equation}
+但要做到这一点，我们需要能够从样本估计梯度 $\nabla_\theta J_{\theta_k}$。把这个梯度改写成对样本的期望，会得到一个被称为“REINFORCE 策略梯度”的表达式，其名称来自 REINFORCE 论文 [R.\ J.\ Williams, 1992]。具体而言，我们将看到可以把梯度改写为
+\begin{equation}
+\nabla_\theta \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)] = \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)\, \nabla_\theta \log \pi_\theta(y \mid x)].
+\end{equation}
+
+在走完推导之前，先注意这个表达式蕴含一个直观的算法（REINFORCE）：我们可以从数据集采样问题 $x$，从模型采样回答 $y$，在这些样本上计算 $r(y \mid x)\,\nabla_\theta \log \pi_\theta(y \mid x)$ 的平均，然后走一步梯度。表达式 $r(y \mid x)\,\nabla_\theta \log \pi_\theta(y \mid x)$ 的含义是：上调那些高奖励 $r(y \mid x)$ 的回答 $y$ 的对数概率权重。如果我们重复这个过程并走多步梯度，就得到了一个基本的强化学习训练循环。
+
+为了推导 REINFORCE 策略梯度，我们可以使用对数求导技巧（log-derivative trick；回忆 $\log f(x)$ 的导数是 $f'\frac{x}{f(x)}$）：
+\begin{equation}
+\nabla_\theta \pi_\theta(y \mid x) = \pi_\theta(y \mid x)\, \nabla_\theta \log \pi_\theta(y \mid x).
+\end{equation}
+直接应用这个恒等式就得到想要的结果：
+\begin{align}
+\nabla_\theta \mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)] &= \sum_y \nabla_\theta \pi_\theta(y \mid x)\, r(y \mid x) \\
+&= \sum_y \pi_\theta(y \mid x)\, \nabla_\theta \log \pi_\theta(y \mid x)\, r(y \mid x) \\
+&= \mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)\, \nabla_\theta \log \pi_\theta(y \mid x)].
+\end{align}
+注意，在这些等式中我们省略了对提示的期望 $\mathbb{E}_{x\sim\rho}$，因为 $\nabla_\theta$ 与 $\mathbb{E}_{x\sim\rho}$ 可以交换。
+
+% ==================== 原文第 10 页 ====================
+于是，给定一批提示 $x^{(1)}, \dots, x^{(B)} \overset{\text{iid}}{\sim} \rho$，以及每个提示的 $G$ 个回答 $y^{(i,j)} \overset{\text{iid}}{\sim} \pi_\theta(y \mid x^{(i)})$，我们有如下策略梯度的样本估计：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} r(y^{(i,j)} \mid x^{(i)})\, \nabla_\theta \log \pi_\theta(y^{(i,j)} \mid x^{(i)}),
+\end{equation}
+它上调高奖励回答的权重。为了推导 GRPO，我们将从这个基本策略梯度估计量出发，然后逐一施加修改。
+
+\subsubsection{基线}
+
+虽然基本的 REINFORCE 策略梯度估计量具有正确的期望 $\nabla_\theta J_\theta$，但它的方差很大，使 RL 不稳定。为了稳定训练并缩减方差，人们使用的一种工具是基线（baseline）。基线可以做得非常复杂，而最简单的基线是从奖励中减去一个常数 $b$：
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[(r(y \mid x) - b)\, \nabla_\theta \log \pi_\theta(y \mid x)].
+\end{equation}
+例如，如果我们减去 $b = 0.5$，而奖励 $r$ 是二值的（正确为 1，错误为 0），使用这个估计量意味着：我们从模型采样回答，上调正确回答的权重（权重为 0.5），并下调错误回答的权重（权重为 $-0.5$）。这与我们最初的梯度估计量形成对比：后者以权重 1 上调正确回答的权重，而对错误回答不做任何事（权重为 0）。
+
+本节关键的数学结论告诉我们：只要基线 $b$ 不依赖于动作/回答 $y$（例如它可以是常数、$x$ 的函数，或策略的函数），减去基线 $b$ 就能保持估计量的期望。只要 $b$ 不依赖于 $y$，在估计量中减去它就能保持其期望：
+\begin{equation}
+\mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[(r(y \mid x) - b)\, \nabla_\theta \log \pi_\theta(y \mid x)] = \mathbb{E}_{x\sim\rho}\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)\, \nabla_\theta \log \pi_\theta(y \mid x)].
+\end{equation}
+这个事实直接来自如下恒等式：
+\begin{equation}
+\mathbb{E}_{y\sim\pi_\theta(y \mid x)}[\nabla_\theta \log \pi_\theta(y \mid x)] = \nabla_\theta \mathbb{E}_{y\sim\pi_\theta(y \mid x)}[1] = 0,
+\end{equation}
+其中第一步来自把之前的对数求导技巧反向使用。
+
+虽然基线保持估计量的期望，但它们可能增大或减小方差。用记号来表述，“方差”的含义如下：把我们的策略梯度估计量写成样本均值 $\frac{1}{n}\sum_{i=1}^{n} Z_i$，其中每个 $Z_i$ 是对样本 $(x, y)$ 取的表达式 $(r(y \mid x) - b)\nabla_\theta \log \pi_\theta(y \mid x)$，则估计量的方差是 $\frac{\mathbb{E}[Z_i^2] - \mathbb{E}[Z_i]^2}{n}$。我们将在下面的问题中探讨基线何时增大或减小方差。
+
+\medskip
+\noindent\textbf{问题（\tm{baseline\_calcs}）：计算策略梯度估计量的方差（5 分）}
+\par\nobreak\smallskip\hrule\nobreak\medskip
+
+设 $\pi_\theta$ 定义了二值动作空间 $\mathcal{A} = \{0, 1\}$ 上的一个策略，$\pi_\theta(A{=}1) = p = \sigma(\theta)$，其中 $\sigma$ 表示 sigmoid 函数 $\sigma(\theta) = \frac{1}{1+e^{-\theta}}$。我们的二值奖励函数给动作 $A = 1$ 赋予奖励 1，否则为 0，即 $r(A) = \mathbf{1}\{A = 1\}$。
+
+\begin{enumerate}[label=(\alph*)]
+  \item 设策略梯度估计量为
+  \begin{equation}
+  \frac{1}{n}\sum_{i=1}^{n} r(A_i)\, \nabla_\theta \log \pi_\theta(A_i)
+  \end{equation}
+  给定 $n$ 个样本 $A_i \overset{\text{iid}}{\sim} \pi_\theta$。这个估计量的方差是多少？
+
+  \textbf{交付要求：}一个用 $n$ 和 $p$ 表示的表达式，并附上推导。
+
+% ==================== 原文第 11 页 ====================
+  \item 设经基线调整的策略梯度估计量为
+  \begin{equation}
+  \frac{1}{n}\sum_{i=1}^{n} (r(A_i) - b)\, \nabla_\theta \log \pi_\theta(A_i)
+  \end{equation}
+  给定 $n$ 个样本 $A_i \overset{\text{iid}}{\sim} \pi_\theta$。这个估计量的方差是多少？
+
+  \textbf{交付要求：}一个用 $n$、$b$ 和 $p$ 表示的表达式，并附上推导和一些讨论。
+
+  \item 如果我们代入“总体均值”基线 $b = p$，得到的方差是多少？把这个方差与未调整的策略梯度估计量的方差比较：它是总是更低、总是更高，还是视 $p$ 而定有时更高有时更低？
+\end{enumerate}
+
+\noindent\textbf{GRPO 中的基线}
+
+GRPO 的第一个组件是应用“组均值”基线：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} \left(r(y^{(i,j)} \mid x^{(i)}) - \mu_i\right)\nabla_\theta \log \pi_\theta(y^{(i,j)} \mid x^{(i)})
+\end{equation}
+其中 $\mu_i = \frac{1}{G}\sum_{j=1}^{G} r(y^{(i,j)} \mid x^{(i)})$，即模型在提示 $x^{(i)}$ 上的平均奖励。注意，尽管 $\mu_i$ 依赖于回答 $y$，它仍在乘以缩放因子 $\frac{G-1}{G}$ 的意义上保持期望：
+\begin{align}
+&\mathbb{E}_{y^{(1)},\dots,y^{(G)}\sim\pi_\theta(y \mid x)}\!\left[\frac{1}{G}\sum_{j=1}^{G} \left(r(y^{(j)} \mid x) - \mu_i\right)\nabla_\theta \log \pi_\theta(y^{(j)} \mid x)\right] \\
+&\quad = \frac{1}{G}\sum_{j=1}^{G} \mathbb{E}_{y^{(2)},\dots,y^{(G)}\sim\pi_\theta(y \mid x)}\!\left[\mathbb{E}_{y^{(1)}\sim\pi_\theta(y \mid x)}\!\left[\left(r(y^{(1)} \mid x) - \mu_i\right)\nabla_\theta \log \pi_\theta(y^{(1)} \mid x)\right]\right] \\
+&\quad = \frac{1}{G}\sum_{j=1}^{G} \mathbb{E}_{y^{(1)}\sim\pi_\theta(y \mid x)}\!\left[\left(r(y^{(1)} \mid x) - \frac{1}{G} r(y^{(1)} \mid x)\right)\nabla_\theta \log \pi_\theta(y^{(1)} \mid x)\right] \\
+&\quad = \frac{G-1}{G}\, \mathbb{E}_{y\sim\pi_\theta(y \mid x)}[r(y \mid x)\, \nabla_\theta \log \pi_\theta(y \mid x)].
+\end{align}
+这些经过组均值调整的奖励常被称为优势（advantage）：这一项表示的不是绝对奖励，而是该 rollout 相对于平均奖励的“优势”。
+
+\subsubsection{优势归一化}
+
+GRPO 在减去组均值之后的下一个修改，是除以组标准差：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} \frac{r(y^{(i,j)} \mid x^{(i)}) - \mu_i}{\operatorname{std}_i}\, \nabla_\theta \log \pi_\theta(y^{(i,j)} \mid x^{(i)}),
+\end{equation}
+其中 $\operatorname{std}_i = \sqrt{\frac{1}{G}\sum_{j=1}^{G}\left(r(y^{(i,j)} \mid x^{(i)}) - \mu_i\right)^2}$（注意，默认的 \tm{torch.std} 函数使用一个略有不同的样本标准差表达式来做偏差校正；你应当在实现中使用默认的 \tm{torch.std}）。除以标准差不再保持估计量的期望，所以我们不再对原目标 $J_\theta$（期望奖励）做梯度上升。可以把这个修改理解为一种稳定性技巧：如果我们假设每个梯度向量都是 iid 高斯的，
+
+% ==================== 原文第 12 页 ====================
+那么除以组标准差就能保证每一组的梯度更新在范数上大致相等。我们将在下一节更深入地讨论优势归一化。
+
+\subsubsection{序列归一化}
+
+GRPO 中还有另一个似乎是从早期 LLM-PPO 实现继承而来的细节，称为序列归一化（sequence normalization）。回忆一下，我们（到目前为止）的策略梯度估计量如下（其中我们把 $\log \pi_\theta(y^{(i,j)} \mid x^{(i)})$ 展开成了对时间步的求和）：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} \frac{r(y^{(i,j)} \mid x^{(i)}) - \mu_i}{\operatorname{std}_i}\, \nabla_\theta \sum_{t=1}^{\operatorname{len}(y^{(i,j)})} \log \pi_\theta\!\left(y_t^{(i,j)} \mid x^{(i)}, y_{<t}^{(i,j)}\right).
+\end{equation}
+GRPO 又增加了一个序列长度归一化项：
+\begin{equation}
+\hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} \frac{r(y^{(i,j)} \mid x^{(i)}) - \mu_i}{\operatorname{std}_i}\, \nabla_\theta\!\left(\frac{1}{\operatorname{len}(y^{(i,j)})}\sum_{t=1}^{\operatorname{len}(y^{(i,j)})} \log \pi_\theta\!\left(y_t^{(i,j)} \mid x^{(i)}, y_{<t}^{(i,j)}\right)\right).
+\end{equation}
+注意，这个修改进一步改变了期望：它不再对跨序列的所有 token 一视同仁，较长序列中的 token 相对较短序列中的 token 被降权。在下一节中，我们会讨论这个选择，并通过消融实验来看它是否是一个好的修改。但现在，我们只实现原论文中提出的标准 GRPO 算法，所以我们会包含序列归一化。
+
+\subsubsection{整合所有组件}
+
+GRPO 还有一个我们尚未讨论的组件，即裁剪的重要性重加权（clipped importance reweighting）。我们将在作业后面讨论离策略 RL 时再介绍这个组件。简要说来，离策略 RL 指的是通过在每个推理批次上走多个梯度步来加速 RL 的做法；与之相对，在策略 RL 在每个推理批次上只走一个梯度步。“离策略”一词指的是：从第二个梯度步开始，推理批次中的样本已经过时（stale），因为它们来自模型的旧版本。重要性重加权就是对梯度估计量的一种修改，使它能够使用过时样本。眼下我们只做在策略 RL，所以还不需要重要性重加权。
+
+现在，我们拥有了实现在策略 GRPO 所需的全部组件。算法见算法 1。
+
+\medskip
+\noindent\textbf{算法 1：在策略组相对策略优化（GRPO）}
+\par\nobreak\smallskip\hrule\nobreak\smallskip
+\noindent\textbf{输入}\ 初始策略模型 $\pi_{\theta_0}$；奖励函数 $r$；任务分布（或数据集）$\rho$；学习率 $\alpha$
+
+\noindent\textbf{输出}\ $\pi_\theta$
+\par\nobreak\smallskip\hrule\nobreak\smallskip
+
+\begin{enumerate}[label=\arabic*., leftmargin=2.2em, itemsep=2pt]
+  \item 策略模型 $\pi_\theta \leftarrow \pi_{\theta_0}$
+  \item 对 \tm{step} $= 1, \dots,$ \tm{n\_grpo\_steps}：
+  \item \hspace*{1.5em}采样一批问题 $x^{(1)}, \dots, x^{(B)} \overset{\text{iid}}{\sim} \rho$
+  \item \hspace*{1.5em}为每个问题采样 $G$ 个输出：$y^{(i,1)}, \dots, y^{(i,G)} \overset{\text{iid}}{\sim} \pi_\theta(y \mid x^{(i)})$
+  \item \hspace*{1.5em}计算在策略 GRPO 策略梯度估计量
+  \begin{equation}
+  \hat{g} \leftarrow \frac{1}{BG}\sum_{i=1}^{B}\sum_{j=1}^{G} \frac{1}{\operatorname{len}(y^{(i,j)})}\sum_{t=1}^{\operatorname{len}(y^{(i,j)})} \frac{r(y^{(i,j)} \mid x^{(i)}) - \mu_i}{\operatorname{std}_i}\, \nabla_\theta \log \pi_\theta\!\left(y_t^{(i,j)} \mid x^{(i)}, y_{<t}^{(i,j)}\right),
+  \end{equation}
+  其中
+  \begin{equation}
+  \mu_i = \frac{1}{G}\sum_{j=1}^{G} r(y^{(i,j)} \mid x^{(i)})
+  \end{equation}
+  表示组均值，而
+  \begin{equation}
+  \operatorname{std}_i = \sqrt{\frac{1}{G}\sum_{j=1}^{G}\left(r(y^{(i,j)} \mid x^{(i)}) - \mu_i\right)^2}
+  \end{equation}
+  表示组标准差。
+  \item 用你喜欢的优化器更新 $\theta$（我们在下面给出随机梯度上升更新）：
+  \begin{equation}
+  \theta \leftarrow \theta + \alpha \hat{g}.
+  \end{equation}
+\end{enumerate}
+\par\nobreak\smallskip\hrule
+
+% ==================== 原文第 13 页 ====================
+\subsection{实现在策略 GRPO}
+
+\subsubsection{使用 Hugging Face 模型}
+
+虽然前几次作业使用的是我们自己在 \tm{cs336\_basics} 中的语言模型实现，但本作业将直接使用 Hugging Face \tm{transformers} 库来加载预训练的基础模型。如果你愿意，也欢迎自己实现 transformer 和预训练权重加载器；只要确保架构与 OLMo-2-0425-1B 的一致即可。
+
+要加载 Hugging Face 模型和分词器（以 bfloat16 并使用 FlashAttention-2 以节省内存），可以使用以下起始代码，见 \tm{cs336\_alignment/checkpoint.py}：
+
+\begin{lstlisting}
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+def get_model_and_tokenizer(model_id_or_dir: str, device: str):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id_or_dir,
+        device_map=device,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager" if device=='cpu' else "flash_attention_2",
+    )
+\end{lstlisting}
+
+% （该代码清单的最后两行在原文第 14 页顶部，见 part2.tex 开头）

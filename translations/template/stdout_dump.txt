@@ -1,0 +1,51 @@
+This is XeTeX, Version 3.141592653-2.6-0.999998 (TeX Live 2026) (preloaded format=xelatex)
+ restricted \write18 enabled.
+entering extended mode
+(./space_test3.tex
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/ctexart.cls
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctexbackend
+.cfg)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3kernel/expl3.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3backend/l3backend-xet
+ex.def))
+Document Class: ctexart 2022/07/14 v2.5.10 Chinese adapter for class article (C
+TEX)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/ctexhook.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/ctexpatch.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/fix-cm.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/ts1enc.def))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctexopts.cf
+g) (d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2025/01/22 v1.4n Standard LaTeX document class
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/size11.clo))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/engine/ctex-engine
+-xetex.def
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/xelatex/xecjk/xeCJK.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3packages/xtemplate/xt
+emplate.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/fontspec/fontspec.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3packages/xparse/xpars
+e.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/fontspec/fontspec-xetex
+.sty (d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/fontenc.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/fontspec/fontspec.cfg))
+) (d:/Software/DevTools/texlive/2026/texmf-dist/tex/xelatex/xecjk/xeCJK.cfg)))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/zhnumber/zhnumber.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/zhnumber/zhnumber-utf8.
+cfg))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/scheme/ctex-scheme
+-chinese-article.def
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctex-name-u
+tf8.cfg))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/fontset/ctex-fonts
+et-windows.def))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctex.cfg)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/geometry/geometry.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics/keyval.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/generic/iftex/ifvtex.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/generic/iftex/iftex.sty)))
+(./space_test3.aux)
+*geometry* driver: auto-detecting
+*geometry* detected driver: xetex

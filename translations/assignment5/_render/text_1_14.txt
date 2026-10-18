@@ -1,0 +1,783 @@
+
+========== PAGE 1 ==========
+CS336 Assignment 5 (alignment): Reasoning RL
+Version 26.0.0
+CS336 Staff
+Spring 2026
+1 Assignment Overview
+In this assignment, you will gain some hands-on experience training a language model to reason and solve 
+downstream tasks.
+What you will implement
+1. Zero-shot, few-shot, and chain-of-thought prompting.
+2. Group Relative Policy Optimization (GRPO), a reinforcement learning algorithm to improve model 
+performance given external rewards.
+3. Policy gradient estimation variants, to explore variance reduction and importance weight clipping 
+strategies.
+What you will run
+1. Measure prompting performance for OLMo-2-0425-1B on GSM8K.
+2. Run on-policy GRPO on OLMo-2-0425-1B to improve performance on GSM8K.
+3. Run RL variants, including RFT, Dr. GRPO, and MaxRL, to explore algorithmic choices in RL.
+4. Run off-policy GRPO, to speed up training and explore various clipping strategies.
+What the code looks like
+All the assignment code as well as this writeup are available on GitHub at: 
+github.com/stanford-cs336/assignment5-alignment Please git clone the repository. If there are any 
+updates, we will notify you and you can git pull to get the latest.
+1. cs336_alignment/*: This is where you’ll write your code for assignment 5. Note that there’s no code in 
+here (aside from the starter code described below), so you should be able to do whatever you want 
+from scratch.
+2. cs336_alignment/vllm_utils.py: This file contains code to run a vLLM server that produces 
+generations and can sync weights.
+3. cs336_alignment/drgrpo_grader.py: This file contains code to grade model outputs for math problems.
+4. cs336_alignment/prompts/*: For your convenience, we’ve provided text files with prompts.
+5. tests/*.py: This directory contains the required GRPO tests and optional alignment/safety 
+supplement tests.
+The required tests in tests/test_grpo.py invoke the hooks defined in tests/adapters.py. You’ll 
+implement the adapters to connect your code to the tests. Writing more tests and/or modifying the test 
+code can be helpful for debugging your code, but your implementation is expected to pass the original 
+provided test suite.
+1. README.md: This file contains some basic instructions on setting up your environment.
+How to submit
+You will submit the following files to Gradescope:
+1
+
+========== PAGE 2 ==========
+• writeup.pdf: Answer all the written questions. Please typeset your responses.
+• code.zip: Contains all the code you’ve written.
+Run the script in test_and_make_submission.sh to create the code.zip file.
+2 Introduction
+2.1 Background
+In the first four assignments of this class, we learned about how to pretrain a base model. We’re now 
+ready to learn about post-training: once we have a base model, how do we turn it into a useful tool that 
+can solve downstream tasks?
+One component of post-training is alignment. Pre-training, due to both its data mixture and training 
+objective, has the effect of imbuing a model with a broad range of knowledge and behaviors. But when we 
+ask the model to solve tasks, we want a specific behavior, that of a helpful and harmless assistant. The 
+process of turning a broad base model into a focused chat model is called “instruction tuning” or 
+“alignment,” and we’ll cover these techniques in the optional Assignment 5 supplement.
+One other component of post-training is reinforcement learning. In pre-training, because our goal is to 
+imbue the model with a broad knowledge base, we use a broad set of data (text on the web). In post-
+training RL, our goal narrows: we want the model to attain high accuracy on a specific task, like solving 
+math problems. This narrower goal differs from pre-training in at least two ways: (a) we no longer have as 
+much data, and (b) our training objective changes from one of “coverage” (having a broad knowledge 
+base) to one of “precision” (producing accurate responses). As a result of these differences, we need a new 
+technique, namely reinforcement learning (RL).
+In RL, we are given a dataset of questions, and a scoring function that judges whether a response 
+correctly solves the question. For example, in a coding setting, we might be given a coding problem (e.g. 
+“Write a Python function that reverses a list”), and a scoring function consisting of a set of test cases 
+(e.g. assert f([0, 1, 2]) == [2, 1, 0]). Or in a math setting, we might be given a mathematical 
+reasoning word problem (e.g. “If Tom was half John’s age four years ago and John is now twenty, how old 
+is Tom now?”), and a scoring function that parses the final answer and checks that it is correct (12). 
+Notably, unlike in pretraining, we are not given a dataset of responses to mimic: in the coding example, 
+we are not given a correct Python program that solves the task, and in the mathematical reasoning 
+example, we are not given a correct chain of reasoning that produces the answer. Instead, in RL, we 
+directly take gradient steps on model accuracy as the objective function. At a high level, RL will involve 
+sampling responses from the model, grading them with the scoring function, and then upweighting the 
+ones that are correct.
+In this assignment, we’ll learn about RL both mathematically and empirically. It turns out that RL is 
+hard, in that it is slow and unstable. Doing science for RL is also hard, in that RL runs have high 
+variance across random seeds, and seemingly small details in implementation matter a lot. This 
+assignment will introduce LLM RL and explore some of its challenges.
+2.2 Model and dataset
+For this assignment, we will be using OLMo-2-0425-1B, a base model that was pre-trained on 
+OLMo-mix-1124 and mid-trained on Dolmino-mix-1124, with 4 trillion tokens total. OLMo-mix-1124 
+consists mostly of DCLM-Baseline [J. Li et al., 2024], a dataset we’ve covered in lecture, while Dolmino-
+mix-1124 is a more focused data mixture containing roughly 50% DCLM and 50% instruction following, 
+math, code, STEM paper, and wiki data. Other OLMo-2-0425-1B details can be found in the OLMo 2 
+2
+
+========== PAGE 3 ==========
+technical report [T. OLMo et al., 2024]. At this point in the class you should have all the background 
+needed to understand each of their design decisions.
+As our downstream task, we will use the GSM8K dataset [K. Cobbe et al., 2021], which is available in the 
+assignment repository at data/gsm8k/train.jsonl and data/gsm8k/test.jsonl, or online here. This dataset 
+contains a relatively easy collection of grade school mathematical reasoning word problems. An example is 
+below:
+{
+  "question": "Natalia sold clips to 48 of her friends in April, and then she sold half as 
+many clips in May. How many clips did Natalia sell altogether in April and May?",
+  "answer": "Natalia sold 48/2 = <<48/2=24>>24 clips in May.\nNatalia sold 48+24 = 
+<<48+24=72>>72 clips altogether in April and May.\n#### 72"
+}
+During RL, our model will learn to produce reasoning chains for problems of this style, improving its 
+ability to solve math problems.
+A note on model and dataset choice: due to resource constraints, we’ve chosen just one small-scale 
+model-dataset combination to serve as our RL testbed. In particular, we’ve chosen a small model that’s 
+quite capable due to being trained on a very large amount of tokens (4000x the parameter count!), 
+allowing us to see reasonable RL results at small scales on a realistic dataset. The models we trained in 
+this class are unfortunately too weak to solve math problems. If you’re curious after completing this 
+assignment, you’re also welcome to take the model you trained in this class and run RL on an easier task. 
+Since RL training dynamics are very model- and dataset-dependent, you should keep in mind that the 
+results we see in this assignment may not transfer to other model-dataset combinations.
+2.3 Notation
+This assignment will have some math in it, so in the following table we provide some of the notation we 
+will use later. Language modeling and reinforcement learning often use different terms for the same 
+object, so the table includes both terms. Feel free to come back to this table if you’ve forgotten what a 
+piece of notation refers to.
+Notation
+LM terminology
+RL terminology
+Meaning
+𝜌
+prompt distribution 
+or dataset
+initial state 
+distribution
+Distribution over prompts/problems.
+𝑥
+prompt; question
+initial state
+A prompt/problem sampled from 𝜌.
+𝑦
+response; 
+completion; 
+generation; sample
+rollout; trajectory; 
+sampled action 
+sequence
+A sampled answer to prompt 𝑥.
+𝑦𝑡
+token
+action
+The 𝑡-th generated token in 𝑦.
+𝑦<𝑡
+prefix
+All generated tokens before position 𝑡, 
+or 𝑦1, …, 𝑦𝑡−1.
+𝜋𝜃
+model
+policy
+A model with parameters 𝜃, which 
+assigns probabilities 𝜋𝜃(𝑦| 𝑥) to 
+responses 𝑦 given prompts 𝑥.
+3
+
+========== PAGE 4 ==========
+𝜋𝜃(𝑦𝑡| 𝑥, 𝑦<𝑡)
+next-token 
+distribution
+policy at timestep 𝑡
+Conditional probability of token 𝑦𝑡 given 
+the prompt and previous generated 
+tokens.
+𝑟(𝑦| 𝑥)
+reward
+Scalar score denoting the correctness of 
+a sampled response (0 or 1 in this 
+assignment).
+𝐵
+number of prompts 
+per batch
+Number of prompts per inference batch.
+𝐺
+generations per 
+prompt
+group size
+Number of responses sampled for each 
+prompt.
+len(𝑦) or 𝐿
+response length
+horizon
+Number of generated tokens in a 
+response.
+𝐴(𝑖,𝑗)
+advantage
+Weight assigned to response 𝑗 for 
+prompt 𝑖 after baseline and 
+normalization.
+3 Prompting
+Our first step in applying our pretrained base model to downstream tasks is to prompt it. Base models 
+are pretrained on a wide range of behaviors, and prompting is a lightweight way to shape its behavior 
+toward task-solving modes. Later in the assignment, we’ll also see that the prompt choice shapes RL 
+dynamics and exploration.
+The most basic way to prompt the model is to provide the question, and sample from its next token 
+distribution to produce the answer; we will call this strategy question_only. We will compare this 
+strategy to the r1_zero prompt, which includes both the question and instructions for the model to do 
+chain-of-thought reasoning [DeepSeek-AI et al., 2025].
+3.1 Using vLLM for inference
+To generate responses from the model, we will need an inference engine. Implementing an inference engine 
+is outside the scope of this assignment, so we will use the vLLM inference engine [W. Kwon et al., 2023], 
+which implements a variety of optimizations including fast CUDA kernels, PagedAttention for efficient 
+attention KV caching, and so on. Code to start a vLLM server and produce generations has been 
+provided in cs336_alignment/vllm_utils.py, which has the following interface:
+@dataclass
+class VLLMCompletion:
+    text: str
+    token_ids: list[int]
+    finish_reason: str | None
+@dataclass
+class VLLMServer:
+    model_id: str
+    gpu: int = 0
+    seed: int = 0
+    gpu_memory_utilization: float = 0.9
+4
+
+========== PAGE 5 ==========
+    def start(self) -> None: ...
+    def generate_completions(
+        self,
+        prompts: list[str],
+        sampling_params: dict,
+        batch_size: int | None = None,
+    ) -> list[VLLMCompletion]: ...
+3.2 Zero-shot, few-shot, and chain-of-thought prompting
+Unless otherwise specified, for experiments on GSM8K we will use the following prompt from the 
+DeepSeek R1-Zero model [DeepSeek-AI et al., 2025]. We will refer to this as the r1_zero prompt:
+A conversation between User and Assistant. The User asks a question, and the Assistant solves 
+it. The Assistant first thinks about the reasoning process in the mind and then provides the 
+User with the answer. The reasoning process is enclosed within <think> </think> and the 
+answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning 
+process here </think> <answer> answer here </answer>.
+User: {question}
+Assistant: <think>
+The r1_zero prompt is located in the text file cs336_alignment/prompts/r1_zero.prompt.
+In the prompt, question refers to some question that we insert (e.g., Natalia sold clips to 48 of her 
+friends in April, and then she sold half as many clips in May. How many clips did Natalia sell 
+altogether in April and May?). The expectation is that the model plays the role of the assistant, and 
+starts generating the thinking process (since we have already included an opening <think> tag), closes the 
+thinking process with </think>, and then generates a final symbolic answer within the answer tags, like 
+<answer> 4x + 10 </answer>. The purpose of having the model generate tags like <answer> </answer> is 
+so that we can easily parse the model’s output and compare it against a ground truth answer, and so that 
+we can stop response generation when we see the closing answer tag </answer>.
+Another prompting approach, called few-shot prompting, is to prepend a few question-answer pairs before 
+prompting the model with the actual question. A few-shot version of the r1_zero prompt looks like the 
+following:
+A conversation between User and Assistant. The User asks a question, and the Assistant solves 
+it. The Assistant first thinks about the reasoning process in the mind and then provides the 
+User with the answer. The reasoning process is enclosed within <think> </think> and the 
+answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning 
+process here </think> <answer> answer here </answer>.
+User: {question-1}
+Assistant: <think> {reasoning-1} </think> <answer> {answer-1} </answer>
+User: {question-2}
+Assistant: <think> {reasoning-2} </think> <answer> {answer-2} </answer>
+User: {question-3}
+Assistant: <think> {reasoning-3} </think> <answer> {answer-3} </answer>
+User: {question}
+Assistant: <think>
+5
+
+========== PAGE 6 ==========
+Few-shot prompting improves the model’s performance by giving it a few examples of the task it is meant 
+to solve. The reported benchmark numbers for open base models are often few-shot: for example, the 
+result reported for GSM8K on OLMo-2-0425-1B’s model card uses 8-shot prompting. We’ve included a 3-
+shot version of the r1_zero prompt in cs336_alignment/prompts/r1_zero_three_shot_gsm8k.prompt, with 
+examples taken from the OLMES repository.
+Finally, as a baseline, we will include the question_only prompt, available at cs336_alignment/prompts/
+question_only.prompt:
+{question} Please put your final answer within \\boxed{{}}.
+Note that while the prompt is called question_only, we ask for the final answer to be boxed to make it 
+easier for a grader to parse the answer from the response, as discussed in the following section.
+3.3 Grading function
+Once the model generates a response, we need to check whether it is correct. Our math problems include 
+ground truth answers (e.g. 0.5), but the model can provide a correct answer in many ways: for example, 
+it can answer <answer> 1/2 </answer> or The answer is 0.5. So to properly grade model outputs, we 
+need an answer parsing function that takes as input the model’s output and a known ground-truth, and 
+returns a boolean indicating whether the model’s output is correct.
+For our experiments, we will use a fast and fairly accurate answer parser used in recent work on reasoning 
+RL [Z. Liu et al., 2025]. For the r1_zero prompts, this reward function is implemented at 
+cs336_alignment.drgrpo_grader.r1_zero_reward_fn. The question_only prompt does not ask the model 
+to use <think> and <answer> tags, so it should instead be evaluated with 
+cs336_alignment.drgrpo_grader.question_only_reward_fn from the same grader file. Note that the 
+question_only parser looks for a final answer in \boxed{}. These reward functions return a total reward, 
+along with separate format and answer rewards that indicate whether the response follows the expected 
+format and whether the parsed answer is correct. Some works give partial credit (a non-zero total reward) 
+for responses that are formatted correctly but incorrect. In our experiments, we will not give partial 
+credit, so total reward will just be the answer reward, and we will only use format reward for logging.
+Note that these reward functions expect the ground_truth argument to contain just the answer. To 
+extract the answer from ground truth responses in the GSM8K dataset, which contain {rationale} #### 
+{answer}, you should split on #### and strip whitespace.
+3.4 Experiments
+We’re now ready to evaluate the base model’s prompting performance.
+Generation hyperparameters. When generating responses, we’ll sample with temperature 1.0, top-p 
+1.0, max generation length 512. The r1_zero prompts ask the model to end its answer with the string </
+answer>, so when using those prompts we can direct vLLM to stop when the model outputs this string:
+# Based on Dr. GRPO: stop when the model completes its answer
+# https://github.com/sail-sg/understand-r1-zero/blob/
+#   c18804602b85da9e88b4aeeb6c43e2f08c594fbc/train_zero_math.py#L167
+sampling_params['stop'] = ["</answer>"]
+sampling_params['include_stop_str_in_output'] = True
+Only use this stop string for the r1_zero and r1_zero_three_shot prompts, not for the question_only 
+prompt.
+6
+
+========== PAGE 7 ==========
+Problem (prompting_baselines):  Run OLMo-2-0425-1B on GSM8K (5 points)
+(a) Write a script to evaluate OLMo-2-0425-1B performance on GSM8K with zero-shot 
+question_only, zero-shot r1_zero, and few-shot r1_zero_three_shot prompts.
+Then, run your script and observe the outputs. For each prompt, how many model 
+generations fall into each of the following categories: (1) correct with both format and 
+correctness reward 1, (2) format reward 1 and correctness reward 0, (3) format reward 0 and 
+correctness reward 0? Observing at least ten examples of category 2, how many model 
+outputs are actually correct but just not parsed properly? What about category 3?
+Deliverable: A few sentences of commentary, the evaluation metrics, and a few examples of 
+prompts and responses.
+(b) Observing the model outputs, characterize the model’s behavior with each prompt. For 
+example, if we want the model to answer the question, is it enough to just provide the 
+question, or does the model exhibit other behaviors besides just answering the question? How 
+do the zero-shot r1_zero and few-shot r1_zero_three_shot prompts shape the model’s 
+behavior?
+Deliverable: A few sentences of commentary with supporting examples.
+4 Group Relative Policy Optimization
+Now that we’ve measured the model’s performance with just prompting, our next step will be to improve 
+this performance via training. Specifically, we want to optimize the model’s accuracy, or equivalently, its 
+expected reward:
+𝐽𝜃= 𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)],
+(1)
+where 𝜌 is our task distribution over prompts/problems 𝑥, 𝜋𝜃 is our model, 𝑦 is a sampled response/
+solution to 𝑥, and 𝑟(𝑦| 𝑥) denotes whether 𝑦 is a correct answer to 𝑥 (we will also call 𝑟 our “reward 
+function”). Note that this objective is quite different from the pretraining objective we’ve been studying 
+so far in the class: unlike the cross entropy loss 𝐸𝑥∼𝒟︀[−log 𝜋𝜃(𝑥)], where we draw samples from a dataset 
+𝒟︀, our accuracy objective involves an expectation over samples from the model itself. Therefore, we will 
+need new tools to optimize this objective: in particular, we will need to use reinforcement learning (RL). 
+At a high level, RL will involve sampling responses from the model, scoring them with a grading function, 
+and reinforcing the ones that are correct. RL is often slow and challenging, so much of this assignment 
+will involve exploring tools to make it faster and more stable.
+One other aspect of RL is that because it involves sampling from the model, its dynamics are shaped by 
+the prompt one uses during sampling. In particular, one exciting finding in language model research is 
+that when using a chain-of-thought reasoning prompt, performing RL on a strong base model can lead to 
+substantial improvements in its reasoning capabilities [OpenAI et al., 2024; DeepSeek-AI et al., 2025]. 
+Therefore, in this assignment, in addition to exploring core algorithmic ideas in RL, we will also explore 
+its interactions with language modeling techniques like chain-of-thought prompting.
+4.1 Deriving on-policy GRPO
+We will first explore the math behind RL, building up to the Group Relative Policy Optimization 
+(GRPO) algorithm, a commonly used RL algorithm when training language models [Z. Shao et al., 2024]. 
+7
+
+========== PAGE 8 ==========
+Our presentation is based closely on a couple of great resources which walk through these concepts in 
+more depth: OpenAI’s Spinning Up in Deep RL [J. Achiam, 2018] and Nathan Lambert’s Reinforcement 
+Learning from Human Feedback (RLHF) Book [N. Lambert, 2024].
+4.1.1 Language models as policies
+Traditionally in reinforcement learning, we think about a policy which takes in a state 𝑠𝑡 and outputs an 
+action 𝑎𝑡. This action then results in some reward 𝑟𝑡= 𝑟(𝑠𝑡, 𝑎𝑡), and a subsequent state drawn from some 
+next state distribution 𝑠𝑡+1 ∼next_state(𝑠𝑡, 𝑎𝑡). Reinforcement learning then involves optimizing the 
+policy to achieve high reward.
+A causal language model (LM) 𝜋𝜃 with parameters 𝜃 defines a probability distribution over the next 
+token 𝑦𝑡 given the current text prefix 𝑦<𝑡= (𝑦1, …, 𝑦𝑡−1). So in the context of RL, we can think of the 
+next token 𝑦𝑡 as our action 𝑎𝑡 and the current text prefix 𝑦<𝑡 as the state 𝑠𝑡. Hence, the LM is a 
+categorical stochastic policy
+𝑎𝑡∼𝜋𝜃(⋅| 𝑠𝑡), 𝜋𝜃(𝑎𝑡| 𝑠𝑡) = [softmax (𝑓𝜃(𝑠𝑡))]𝑎𝑡.
+(2)
+We will need two primitive operations when optimizing a policy with policy gradients:
+1. Sampling from the policy: drawing an action 𝑎𝑡 from the categorical distribution above;
+2. Scoring the log-likelihood of an action: evaluating log 𝜋𝜃(𝑎𝑡| 𝑠𝑡).
+Generally, when doing RL with LLMs, 𝑠𝑡 is the partial completion/solution produced so far, and each 𝑎𝑡 
+is the next token of the solution; the episode ends when an end-of-text token is emitted, like <|
+end_of_text|>, or </answer> in the case of our r1_zero prompt.
+4.1.2 Trajectories
+In reinforcement learning, we start at an initial state drawn from some starting distribution 𝑠0 ∼𝜌. We 
+then sample an action 𝑎𝑡 from the policy 𝜋𝜃, transition to the next state according to some next state 
+distribution 𝑠𝑡+1 ∼next_state(𝑠𝑡, 𝑎𝑡), and repeat. This series of states and actions then forms a (finite-
+horizon) trajectory:
+𝜏= (𝑠0, 𝑎0, 𝑠1, 𝑎1, …, 𝑠𝑇, 𝑎𝑇),
+(3)
+where 𝑇 is the length of the trajectory, i.e., 𝑎𝑇 is an end-of-text token or we have reached a maximum 
+generation budget in tokens.
+In our case, 𝑠0 ∼𝜌 is our prompt 𝑥 containing the math problem we want to solve (possibly with CoT 
+prompting or few-shot applied). Starting with this prefix, we then sample tokens one by one, and the next 
+state is the old prefix concatenated with the emitted token, or 𝑠𝑡+1 = (𝑠𝑡, 𝑎𝑡). Trajectories are also called 
+episodes or rollouts; we will use these terms interchangeably.
+4.1.3 Rewards and return
+In RL, a scalar reward 𝑟𝑡= 𝑟(𝑠𝑡, 𝑎𝑡) judges the immediate quality of the action taken at state 𝑠𝑡. For RL 
+on verified domains, like our task of mathematical word problems, we observe zero reward for 
+intermediate reasoning steps, until we output the answer. We then receive a verified reward on the 
+terminal action
+𝑟𝑇= 𝑟(𝑠𝑇, 𝑎𝑇) ≔{1 if trajectory 𝜏 matches the ground-truth according to our reward function
+0 otherwise
+. (4)
+In our case, 𝑟𝑇 is 1 if our final answer is correct, and 0 otherwise. The return 𝑅(𝜏) aggregates rewards 
+along the trajectory, and in our case is just 𝑟𝑇.
+8
+
+========== PAGE 9 ==========
+The objective of the agent is to maximize the expected return
+𝐽𝜃= 𝐸𝜏∼𝜋𝜃[𝑟(𝜏)],
+(5)
+where 𝜏∼𝜋𝜃 is the distribution over trajectories where we first sample 𝑠0 ∼𝜌, and we then sample 
+actions from the policy and the next states from the next state distribution. In our case, this means first 
+sampling our math problem 𝑥∼𝜌 from our dataset, and then sampling tokens until we hit the end of our 
+response, a process we can denote by 𝑦∼𝜋𝜃(𝑦| 𝑥). This objective leads to the optimization problem
+𝜃∗= arg max
+𝜃
+𝐽𝜃.
+(6)
+4.1.4 Policy gradients
+We now have the notation and definitions we need to learn an RL algorithm called policy gradients. In 
+the remainder of the assignment, we will stick to the language model notation (𝑥, 𝑦) denoting prompts 
+and responses, instead of the RL notation of states 𝑠𝑡 and actions 𝑎𝑡.
+Recall that we want to optimize the model’s expected reward (i.e. accuracy), given by
+𝐽𝜃= 𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)],
+(7)
+where 𝑟(𝑦| 𝑥) denotes whether response 𝑦 is correct for prompt 𝑥. Our approach will be to do gradient 
+ascent on the objective, or
+𝜃𝑘+1 = 𝜃𝑘+ 𝛼∇𝜃𝐽𝜃𝑘,
+(8)
+but to do so, we need to be able to estimate the gradient ∇𝜃𝐽𝜃𝑘 from samples. Rewriting this gradient as 
+an expectation over samples will produce an expression known as the “REINFORCE policy gradient”, 
+named after the REINFORCE paper [R. J. Williams, 1992]. In particular, we’ll see that we can rewrite 
+the gradient as follows:
+∇𝜃𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)] = 𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥)].
+(9)
+Before walking through the derivation, note that this expression implies an intuitive algorithm 
+(REINFORCE): we can sample problems 𝑥 from our dataset, sample responses 𝑦 from our model, 
+compute the average of 𝑟(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥) over these samples, and then take a gradient step. The 
+expression 𝑟(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥) says that we should upweight the log probability of responses 𝑦 with 
+high reward 𝑟(𝑦| 𝑥). If we repeat this procedure and take multiple gradient steps, we have a basic 
+reinforcement learning training loop.
+To derive the REINFORCE policy gradient, we can use the log-derivative trick (recall that the derivative 
+of log 𝑓(𝑥) is 𝑓′
+𝑥
+𝑓(𝑥)):
+∇𝜃𝜋𝜃(𝑦| 𝑥) = 𝜋𝜃(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥).
+(10)
+Applying this identity directly produces the desired result:
+∇𝜃𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)] = ∑
+𝑦
+∇𝜃𝜋𝜃(𝑦| 𝑥)𝑟(𝑦| 𝑥)
+(11)
+= ∑
+𝑦
+𝜋𝜃(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥)𝑟(𝑦| 𝑥)
+(12)
+= 𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥)].
+(13)
+Note that in these equations, we omitted the expectation over prompts 𝐸𝑥∼𝜌 because ∇𝜃 and 𝐸𝑥∼𝜌 can 
+be interchanged.
+9
+
+========== PAGE 10 ==========
+So given a batch of prompts 𝑥(1), …, 𝑥(𝐵) ∼
+iid 𝜌 and 𝐺 responses per prompt 𝑦(𝑖,𝑗) ∼
+iid 𝜋𝜃(𝑦| 𝑥(𝑖)), we have 
+the following sample estimate of the policy gradient:̂
+𝑔←
+1
+𝐵𝐺∑
+𝐵
+𝑖=1
+∑
+𝐺
+𝑗=1
+𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖))∇𝜃log 𝜋𝜃(𝑦(𝑖,𝑗) | 𝑥(𝑖)),
+(14)
+which upweights responses with high reward. To derive GRPO, we will start with this basic policy 
+gradient estimator and then apply modifications one by one.
+4.1.5 Baselines
+While the basic REINFORCE policy gradient estimator has the correct expectation ∇𝜃𝐽𝜃, it has high 
+variance, making RL unstable. To stabilize training and reduce variance, one tool people use is baselines.
+While baselines can get quite complicated, the simplest baseline is to subtract a constant 𝑏 from the 
+reward:
+𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[(𝑟(𝑦| 𝑥) −𝑏)∇𝜃log 𝜋𝜃(𝑦| 𝑥)].
+(15)
+For example, if we subtract 𝑏= 0.5 and our reward 𝑟 is binary (1 for correct, 0 for incorrect), using this 
+estimator means we sample responses from the model, upweight correct responses (with weight 0.5), and 
+downweight incorrect responses (with weight −0.5). This is in contrast to our original gradient estimator, 
+which upweights correct responses with weight 1 and does nothing for incorrect responses (with weight 0).
+The key piece of math for this section tells us that subtracting a baseline 𝑏 preserves the expectation of 
+the estimator, as long as 𝑏 does not depend on the action/response 𝑦 (e.g. it can be a constant, or a 
+function of 𝑥, or a function of the policy). As long as 𝑏 does not depend on 𝑦, subtracting it in our 
+estimator preserves its expectation:
+𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[(𝑟(𝑦| 𝑥) −𝑏)∇𝜃log 𝜋𝜃(𝑦| 𝑥)] = 𝐸𝑥∼𝜌𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥)].
+(16)
+This fact follows directly from the following identity:
+𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[∇𝜃log 𝜋𝜃(𝑦| 𝑥)] = ∇𝜃𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[1] = 0,
+(17)
+where the first step follows from applying our previous log-derivative trick in reverse.
+While baselines preserve the expectation of the estimator, they can increase or decrease variance. In 
+notation, “variance” means the following: writing our policy gradient estimator as a sample mean 
+1
+𝑛∑𝑛
+𝑖=1 𝑍𝑖, where each 𝑍𝑖 is our expression (𝑟(𝑦| 𝑥) −𝑏)∇𝜃log 𝜋𝜃(𝑦| 𝑥) for a sample (𝑥, 𝑦), the variance 
+of our estimator is 
+𝐸[𝑍2
+𝑖]−𝐸[𝑍𝑖]2
+𝑛
+. We’ll explore when baselines increase or decrease variance in the following 
+problem.
+Problem (baseline_calcs):  Compute the variance of the policy gradient estimator (5 
+points)
+Let 𝜋𝜃 define a policy over the binary action space 𝒜︀= {0, 1} with 𝜋𝜃(𝐴=1) = 𝑝= 𝜎(𝜃), where 𝜎 
+represents the sigmoid function 𝜎(𝜃) =
+1
+1+𝑒−𝜃. Our binary reward function will assign reward 1 to 
+action 𝐴= 1 and reward 0 otherwise, or 𝑟(𝐴) = 𝟙{𝐴= 1}.
+(a) Let the policy gradient estimator be given by
+1
+𝑛∑
+𝑛
+𝑖=1
+𝑟(𝐴𝑖)∇𝜃log 𝜋𝜃(𝐴𝑖)
+(18)
+10
+
+========== PAGE 11 ==========
+given 𝑛 samples 𝐴𝑖∼
+iid 𝜋𝜃. What is the variance of this estimator?
+Deliverable: An expression in terms of 𝑛 and 𝑝, accompanied by a derivation.
+(b) Let the baseline-adjusted policy gradient estimator be given by
+1
+𝑛∑
+𝑛
+𝑖=1
+(𝑟(𝐴𝑖) −𝑏)∇𝜃log 𝜋𝜃(𝐴𝑖)
+(19)
+given 𝑛 samples 𝐴𝑖∼
+iid 𝜋𝜃. What is the variance of this estimator?
+Deliverable: An expression in terms of 𝑛, 𝑏, and 𝑝, accompanied by a derivation and some 
+discussion.
+(c) What is the resulting variance if we substitute the “population mean” baseline 𝑏= 𝑝? 
+Compare this variance to that of the unadjusted policy gradient estimator: is it always lower, 
+always higher, or sometimes higher or lower depending on 𝑝?
+Baselines in GRPO
+The first component of GRPO will be to apply the “group mean” baseline:̂
+𝑔←
+1
+𝐵𝐺∑
+𝐵
+𝑖=1
+∑
+𝐺
+𝑗=1
+(𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖)∇𝜃log 𝜋𝜃(𝑦(𝑖,𝑗) | 𝑥(𝑖))
+(20)
+for 𝜇𝑖= 1
+𝐺∑𝐺
+𝑗=1 𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)), i.e. the average reward of the model on prompt 𝑥(𝑖). Note that even 
+though 𝜇𝑖 depends on the responses 𝑦, it still preserves the expectation up to a rescaling 𝐺−1
+𝐺:
+𝐸𝑦(1),…,𝑦(𝐺)∼𝜋𝜃(𝑦| 𝑥)[ 1
+𝐺∑
+𝐺
+𝑗=1
+(𝑟(𝑦(𝑗) | 𝑥) −𝜇𝑖)∇𝜃log 𝜋𝜃(𝑦(𝑗) | 𝑥)]
+(21)
+= 1
+𝐺∑
+𝐺
+𝑗=1
+𝐸𝑦(2),…,𝑦(𝐺)∼𝜋𝜃(𝑦| 𝑥)[𝐸𝑦(1)∼𝜋𝜃(𝑦| 𝑥)[(𝑟(𝑦(1) | 𝑥) −𝜇𝑖)∇𝜃log 𝜋𝜃(𝑦(1) | 𝑥)]] (22)
+= 1
+𝐺∑
+𝐺
+𝑗=1
+𝐸𝑦(1)∼𝜋𝜃(𝑦| 𝑥)[(𝑟(𝑦(1) | 𝑥) −1
+𝐺𝑟(𝑦(1) | 𝑥))∇𝜃log 𝜋𝜃(𝑦(1) | 𝑥)]
+(23)
+= 𝐺−1
+𝐺
+𝐸𝑦∼𝜋𝜃(𝑦| 𝑥)[𝑟(𝑦| 𝑥)∇𝜃log 𝜋𝜃(𝑦| 𝑥)].
+(24)
+These group-mean-adjusted rewards are often called advantages: instead of the absolute reward, this term 
+represents the “advantage” of this rollout relative to the average reward.
+4.1.6 Advantage normalization
+The next modification in GRPO, after subtracting the group mean, will be to divide by the group 
+standard deviation:̂
+𝑔←
+1
+𝐵𝐺∑
+𝐵
+𝑖=1
+∑
+𝐺
+𝑗=1
+𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖
+std𝑖
+∇𝜃log 𝜋𝜃(𝑦(𝑖,𝑗) | 𝑥(𝑖)),
+(25)
+where std𝑖= √1
+𝐺∑𝐺
+𝑗=1 (𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖)
+2 (note that the default torch.std function uses a slightly 
+different sample std expression to do bias correction; you should use the default torch.std in your 
+implementation). Dividing by the standard deviation no longer preserves the expectation of the estimator, 
+so we’re no longer doing gradient ascent on our original objective 𝐽𝜃 (expected reward). One way to think 
+about this modification is that it is a stability trick: if we assume each gradient vector is iid Gaussian, 
+11
+
+========== PAGE 12 ==========
+dividing by the group std ensures that each group’s gradient update is roughly equal in norm. We’ll dive 
+deeper into advantage normalization in the next section.
+4.1.7 Sequence normalization
+There’s one other detail in GRPO that seems to be inherited from earlier LLM-PPO implementations, 
+called sequence normalization. Recall that our policy gradient estimator (so far) is the following (where 
+we’ve expanded log 𝜋𝜃(𝑦(𝑖,𝑗) | 𝑥(𝑖)) into a sum over time steps):̂
+𝑔←
+1
+𝐵𝐺∑
+𝐵
+𝑖=1
+∑
+𝐺
+𝑗=1
+𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖
+std𝑖
+∇𝜃
+∑
+len(𝑦(𝑖,𝑗))
+𝑡=1
+log 𝜋𝜃(𝑦(𝑖,𝑗)
+𝑡
+| 𝑥(𝑖), 𝑦(𝑖,𝑗)
+<𝑡).
+(26)
+GRPO adds an additional sequence length normalization term:̂
+𝑔←
+1
+𝐵𝐺∑
+𝐵
+𝑖=1
+∑
+𝐺
+𝑗=1
+𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖
+std𝑖
+∇𝜃
+(
+1
+len(𝑦(𝑖,𝑗))
+∑
+len(𝑦(𝑖,𝑗))
+𝑡=1
+log 𝜋𝜃(𝑦(𝑖,𝑗)
+𝑡
+| 𝑥(𝑖), 𝑦(𝑖,𝑗)
+<𝑡)
+)
+.
+(27)
+Note that this modification changes the expectation further: instead of weighting all tokens equally across 
+sequences, tokens in longer sequences are downweighted relative to tokens in shorter sequences. In the 
+next section, we’ll discuss this choice and do ablations to see whether it is a good modification. But for 
+now, we’ll just implement the standard GRPO algorithm, as presented in the original paper, so we will 
+include sequence normalization.
+4.1.8 Putting everything together
+There is one component of GRPO we haven’t talked about yet, namely clipped importance reweighting. 
+We will discuss this component later in the assignment, when we discuss off-policy RL. Briefly, off-policy 
+RL refers to the approach of speeding up RL by taking multiple gradient steps per inference batch, in 
+contrast with on-policy RL where we take one gradient step per inference batch. The term “off-policy” 
+refers to the fact that for the second gradient step onward, samples in the inference batch are now stale, 
+in that they come from an older version of the model. Importance reweighting is then a modification to 
+the gradient estimator that allows it to use stale samples. For now, we will only do on-policy RL, so we 
+won’t need importance reweighting yet.
+We now have all the components we need to implement on-policy GRPO. The algorithm is provided in 
+Algorithm 1.
+12
+
+========== PAGE 13 ==========
+Algorithm 1: On-policy Group Relative Policy Optimization (GRPO)
+Input initial policy model 𝜋𝜃0; reward function 𝑟; task distribution (or dataset) 𝜌; learning rate 𝛼
+Output 𝜋𝜃
+1
+policy model 𝜋𝜃←𝜋𝜃0
+2
+For step = 1, …, n_grpo_steps
+3
+Sample a batch of questions 𝑥(1), …, 𝑥(𝐵) ∼
+iid 𝜌
+4
+Sample 𝐺 outputs per question: 𝑦(𝑖,1), …, 𝑦(𝑖,𝐺) ∼
+iid 𝜋𝜃(𝑦| 𝑥(𝑖))
+5
+Compute the on-policy GRPO policy gradient estimator̂
+𝑔←
+1
+𝐵𝐺∑
+𝐵
+𝑖=1
+∑
+𝐺
+𝑗=1
+1
+len(𝑦(𝑖,𝑗))
+∑
+len(𝑦(𝑖,𝑗))
+𝑡=1
+𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖
+std𝑖
+∇𝜃log 𝜋𝜃(𝑦(𝑖,𝑗)
+𝑡
+| 𝑥(𝑖), 𝑦(𝑖,𝑗)
+<𝑡),
+(28)
+where
+𝜇𝑖= 1
+𝐺∑
+𝐺
+𝑗=1
+𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖))
+(29)
+denotes the group mean and
+std𝑖=
+√
+1
+𝐺∑
+𝐺
+𝑗=1
+(𝑟(𝑦(𝑖,𝑗) | 𝑥(𝑖)) −𝜇𝑖)
+2
+(30)
+denotes the group standard deviation.
+6
+Update 𝜃 with your favorite optimizer (we provide the stochastic gradient ascent update below):
+𝜃←𝜃+ 𝛼̂𝑔.
+(31)
+4.2 Implementing on-policy GRPO
+4.2.1 Using Hugging Face models
+While previous assignments used our own language model implementation in cs336_basics, in this 
+assignment we will use the Hugging Face transformers library directly to load the pre-trained base model. 
+You’re also welcome to implement your own transformer and pre-trained weight loader if you would like; 
+just make sure the architecture matches that of OLMo-2-0425-1B.
+To load a Hugging Face model and tokenizer (in bfloat16 and with FlashAttention-2 to save memory), 
+you can use the following starter code, available in cs336_alignment/checkpoint.py:
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+def get_model_and_tokenizer(model_id_or_dir: str, device: str):
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id_or_dir,
+        device_map=device,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager" if device=='cpu' else "flash_attention_2",
+    )
+13
+
+========== PAGE 14 ==========
+    tokenizer = AutoTokenizer.from_pretrained(model_id_or_dir)
+    return model, tokenizer
+model_id_or_directory can be a model name like allenai/OLMo-2-0425-1B or the path to a directory. The 
+directory will typically be the result of calling save_pretrained, which you can call to save your trained 
+model:
+# Save the model weights
+model.save_pretrained(save_directory=output_dir)
+tokenizer.save_pretrained(save_directory=output_dir)
+First, let’s implement a helper function which uses the pre-trained tokenizer to tokenize input prompts 
+and responses. Tokenize the prompt and response separately without adding special tokens, then 
+concatenate them directly as prompt_ids + response_ids with no EOS, BOS, or separator token between 
+them. We will also need to construct a response_mask: a boolean mask, aligned with the shifted labels, 
+that is True exactly where the label token comes from the response and False for prompt and padding 
+positions. We will use this mask in the training loop to ensure that we only compute the loss on the 
+response tokens.
+Problem (tokenize_prompt_and_output):  Prompt and output tokenization (1 point)
+Deliverable: Implement a method tokenize_prompt_and_output that tokenizes the prompt and 
+output separately, concatenates them together without inserting special tokens, and constructs a 
+response_mask. The following interface is recommended:
+def tokenize_prompt_and_output(
+    prompt_strs: list[str], 
+    output_strs: list[str], 
+    tokenizer: PreTrainedTokenizer,
+) -> dict[str, torch.Tensor]:
+Tokenize the prompt and output strings, and construct a mask aligned with labels that is 1 for 
+response tokens and 0 for other tokens (prompt or padding).
+Args:
+• prompt_strs: list[str] List of prompt strings.
+• output_strs: list[str] List of output strings.
+• tokenizer: PreTrainedTokenizer Tokenizer to use for tokenization.
+Returns:
+• dict[str, torch.Tensor]. Let prompt_and_output_lens be a list containing the lengths of the 
+concatenated tokenized prompt and output strings. Then the returned dictionary should have 
+the following keys:
+‣ input_ids torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1): the 
+tokenized prompt and output strings, with the final token sliced off.
+‣ labels torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1): shifted input 
+ids, i.e., the input ids without the first token.
+14

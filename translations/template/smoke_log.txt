@@ -1,0 +1,88 @@
+This is XeTeX, Version 3.141592653-2.6-0.999998 (TeX Live 2026) (preloaded format=xelatex)
+ restricted \write18 enabled.
+entering extended mode
+(./smoke.tex
+LaTeX2e <2025-11-01>
+L3 programming layer <2026-01-19>
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/ctexart.cls
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctexbackend
+.cfg)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3kernel/expl3.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3backend/l3backend-xet
+ex.def))
+Document Class: ctexart 2022/07/14 v2.5.10 Chinese adapter for class article (C
+TEX)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/ctexhook.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/ctexpatch.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/fix-cm.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/ts1enc.def))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctexopts.cf
+g) (d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/article.cls
+Document Class: article 2025/01/22 v1.4n Standard LaTeX document class
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/size11.clo))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/engine/ctex-engine
+-xetex.def
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/xelatex/xecjk/xeCJK.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3packages/xtemplate/xt
+emplate.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/fontspec/fontspec.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/l3packages/xparse/xpars
+e.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/fontspec/fontspec-xetex
+.sty (d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/base/fontenc.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/fontspec/fontspec.cfg))
+) (d:/Software/DevTools/texlive/2026/texmf-dist/tex/xelatex/xecjk/xeCJK.cfg)))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/zhnumber/zhnumber.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/zhnumber/zhnumber-utf8.
+cfg))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/scheme/ctex-scheme
+-chinese-article.def
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctex-name-u
+tf8.cfg))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/fontset/ctex-fonts
+et-windows.def))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/ctex/config/ctex.cfg)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/geometry/geometry.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics/keyval.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/generic/iftex/ifvtex.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/generic/iftex/iftex.sty)))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsmath/amsmath.sty
+For additional information on amsmath, use the `?' option.
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsmath/amstext.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsmath/amsgen.sty))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsmath/amsbsy.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsmath/amsopn.sty))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsfonts/amssymb.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsfonts/amsfonts.sty))
+ (d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics/graphicx.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics/graphics.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics/trig.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics-cfg/graphics.c
+fg)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics-def/xetex.def)
+))
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/booktabs/booktabs.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/listings/listings.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/listings/lstpatch.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/listings/lstmisc.sty)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/listings/listings.cfg))
+
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/xelatex/xecjk/xeCJK-listings.
+sty)
+==> First Aid for listings.sty no longer applied!
+    Expected:
+        2024/09/23 1.10c (Carsten Heinz)
+    but found:
+        2025/11/14 1.11b (Carsten Heinz)
+    so I'm assuming it got fixed.
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/xcolor/xcolor.sty
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics-cfg/color.cfg)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/graphics/mathcolor.ltx)
+) (./smoke.aux)
+*geometry* driver: auto-detecting
+*geometry* detected driver: xetex
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsfonts/umsa.fd)
+(d:/Software/DevTools/texlive/2026/texmf-dist/tex/latex/amsfonts/umsb.fd)
+[1] (./smoke.aux) )
+Output written on smoke.pdf (1 page).
+Transcript written on smoke.log.
