@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
-import resource
 import sys
 
 import psutil
 import pytest
 import tiktoken
+
+try:
+    import resource
+except ImportError:  # Unix-only; only used by the linux-gated memory tests
+    resource = None
 
 from .adapters import get_tokenizer
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
