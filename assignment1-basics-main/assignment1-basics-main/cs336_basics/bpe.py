@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from tqdm import tqdm
 import heapq
+from einops import rearrange, reduce, repeat
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 _PAT = re.compile(PAT)

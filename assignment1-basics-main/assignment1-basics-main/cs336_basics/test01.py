@@ -1,7 +1,11 @@
 import torch
+import numpy as np
 
-test_string = 'hello!'
-print(test_string.encode('utf-8'))
+m = np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
 
-list = [1] * 3
-print(list)
+i = [[1, 2]]
+j = [[1, 2]]
+
+k = torch.arange(4)
+
+print(k)
