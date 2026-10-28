@@ -179,4 +179,61 @@ class Transformer(nn.Module):
 
 def cross_entropy(logits: torch.Tensor, target: torch.Tensor): 
     probs = softmax(logits, dim=-1)
-    
+    target = target.unsqueeze(dim=-1)
+    right_probs = torch.gather(probs, dim=-1, index=target).squeeze(dim=-1)
+    return torch.mean(-torch.log(right_probs))
+
+
+
+class AdamW(torch.optim.Optimizer):
+    def __init__(self, params, lam, lr=5e-4, beta1=0.9, beta2=0.95, eps=1e-8):
+        defaults = {
+            'lr': lr,
+            'beta1': beta1,
+            'beta2': beta2,
+            'eps': eps,
+            'lambda': lam,
+        }
+
+        super().__init__(params, defaults)
+
+    def step(self, closure):
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1 = group['beta1']
+            beta2 = group['beta2']
+            eps = group['eps']
+            lam = group['lambda']
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                state = self.state[p]
+                t = state.get('t', 1)
+                if not state:
+                    state['m'] = torch.zeros_like(p)
+                    state['v'] = torch.zeros_like(p)
+                m, v = state['m'], state['v']
+                g = p.grad
+                alpha = lr * math.sqrt(1-beta2**t) / (1-beta1**t)
+
+                with torch.no_grad():
+                    p *= (1 - alpha * lam)
+                    m = beta1 * m + (1-beta1) * g
+                    v = beta2 * v + (1-beta2) * (g**2)
+                    p -= alpha * m / (torch.sqrt(v) + eps)
+
+            
+def learning_rate_schedule(t, alpha_max, alpha_min, Tw, Tc):
+    if t < Tw: return alpha_max * t / Tw
+    elif Tw <= t <= Tc: return alpha_min + (1 + math.cos((t-Tw)/(Tc-Tw)*math.pi)) * (alpha_max - alpha_min) / 2
+    else: return alpha_min
+
+@torch.no_grad()
+def gradient_clipping(params, gmax: float, eps: float=1e-6):
+    for p in params:
+        norm = torch.linalg.norm(p)
+        if norm < gmax: 
+            continue
+        g *= gmax / (norm+eps)
+
+
