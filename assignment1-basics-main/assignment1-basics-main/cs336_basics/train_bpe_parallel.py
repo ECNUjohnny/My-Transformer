@@ -26,7 +26,7 @@ from pathlib import Path
 import regex as re
 from tqdm import tqdm
 
-from bpe import PAT, init_vocab, merge_loop, to_byte_tuples
+from cs336_basics.my_bpe import PAT, init_vocab, merge_loop, to_byte_tuples
 from parallel import find_chunk_boundaries
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from torch import nn
 from einops import rearrange, reduce, repeat, einsum
 import math
@@ -177,27 +178,29 @@ class Transformer(nn.Module):
         return self.lm_head(self.ln_final(x))
 
 
-def cross_entropy(logits: torch.Tensor, target: torch.Tensor): 
-    probs = softmax(logits, dim=-1)
-    target = target.unsqueeze(dim=-1)
-    right_probs = torch.gather(probs, dim=-1, index=target).squeeze(dim=-1)
-    return torch.mean(-torch.log(right_probs))
+def cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # -log softmax(logits)_t = lse - logit_t：全程在 log 域，正确类概率再小也不会下溢出 inf
+    x_max = torch.max(logits, dim=-1, keepdim=True).values          # 防溢出的最大值
+    lse = x_max + torch.log(torch.exp(logits - x_max).sum(dim=-1))  # 稳定的 log-sum-exp
+    picked = torch.gather(logits, dim=-1, index=target.unsqueeze(-1)).squeeze(-1)  # 正确类的 logit
+    return torch.mean(lse - picked)
 
 
 
 class AdamW(torch.optim.Optimizer):
-    def __init__(self, params, lam, lr=5e-4, beta1=0.9, beta2=0.95, eps=1e-8):
+    def __init__(self, params, lr=5e-4, weight_decay=1e-2, betas=(0.9, 0.95), eps=1e-8):
+        beta1, beta2 = betas
         defaults = {
             'lr': lr,
             'beta1': beta1,
             'beta2': beta2,
             'eps': eps,
-            'lambda': lam,
+            'lambda': weight_decay,
         }
 
         super().__init__(params, defaults)
 
-    def step(self, closure):
+    def step(self, closure=None):
         for group in self.param_groups:
             lr = group['lr']
             beta1 = group['beta1']
@@ -208,18 +211,21 @@ class AdamW(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 state = self.state[p]
-                t = state.get('t', 1)
-                if not state:
+                if not state:                      # 懒初始化
+                    state['t'] = 0
                     state['m'] = torch.zeros_like(p)
                     state['v'] = torch.zeros_like(p)
+                t = state['t'] + 1                 # t 从 1 开始（讲义规定）
+                state['t'] = t
                 m, v = state['m'], state['v']
                 g = p.grad
                 alpha = lr * math.sqrt(1-beta2**t) / (1-beta1**t)
 
                 with torch.no_grad():
-                    p *= (1 - alpha * lam)
+                    p *= (1 - lr * lam)
                     m = beta1 * m + (1-beta1) * g
                     v = beta2 * v + (1-beta2) * (g**2)
+                    state['m'], state['v'] = m, v
                     p -= alpha * m / (torch.sqrt(v) + eps)
 
             
@@ -230,10 +236,45 @@ def learning_rate_schedule(t, alpha_max, alpha_min, Tw, Tc):
 
 @torch.no_grad()
 def gradient_clipping(params, gmax: float, eps: float=1e-6):
+    norm = 0
     for p in params:
-        norm = torch.linalg.norm(p)
-        if norm < gmax: 
+        if p.grad is None:
             continue
-        g *= gmax / (norm+eps)
+        norm += torch.linalg.norm(p.grad)**2
+    if math.sqrt(norm) > gmax:
+        for p in params:
+            if p.grad is None:
+                continue
+            p.grad *= gmax / (eps+norm**0.5)
+
+
+def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
+                    iteration: int, out) -> None:
+    torch.save({
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'iteration': iteration,
+    }, out)
+
+
+def load_checkpoint(src, model: nn.Module, optimizer: torch.optim.Optimizer) -> int:
+    ckpt = torch.load(src, map_location='cpu')
+    model.load_state_dict(ckpt['model'])
+    optimizer.load_state_dict(ckpt['optimizer'])
+    return ckpt['iteration']
+
+
+def get_batch(dataset: np.ndarray, batch_size: int, context_length: int,
+              device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    n = len(dataset)
+    # 标签要读到 i + context_length，所以起点上限是 n - context_length - 1（randint 上界开区间）
+    starts = np.random.randint(0, n - context_length, size=batch_size)
+    idx = starts[:, None] + np.arange(context_length)          # 广播出 (batch, context) 索引矩阵
+    x = torch.from_numpy(dataset[idx].astype(np.int64)).to(device)
+    y = torch.from_numpy(dataset[idx + 1].astype(np.int64)).to(device)
+    return x, y
+
+
+
 
 
