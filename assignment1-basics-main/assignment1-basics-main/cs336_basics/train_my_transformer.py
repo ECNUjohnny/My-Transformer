@@ -42,11 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     # 数据
     ap.add_argument('--dataset', default='data/TinyStories-train.npy', help='token id 的 .npy 文件（uint16）')
     ap.add_argument('--vocab-size', type=int, default=10000)
-    ap.add_argument('--context-length', type=int, default=512)
+    ap.add_argument('--context-length', type=int, default=256)
     ap.add_argument('--batch-size', type=int, default=32)
     # 模型结构
     ap.add_argument('--d-model', type=int, default=512)
-    ap.add_argument('--num-layers', type=int, default=4)
+    ap.add_argument('--num-layers', type=int, default=16)
     ap.add_argument('--num-heads', type=int, default=16)
     ap.add_argument('--d-ff', type=int, default=None, help='缺省按 8/3*d_model 取整到 64 的倍数')
     ap.add_argument('--theta', type=float, default=10000.0, help='RoPE 的 Θ')
@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--weight-decay', type=float, default=0.01)
     ap.add_argument('--grad-clip', type=float, default=1.0, help='全局梯度范数上限')
     # 训练过程
-    ap.add_argument('--max-iters', type=int, default=20000, help='总训练迭代数，也是 cosine 周期 T_c')
+    ap.add_argument('--max-iters', type=int, default=30000, help='总训练迭代数，也是 cosine 周期 T_c')
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--log-interval', type=int, default=10)
