@@ -86,8 +86,8 @@ def train_bpe_parallel(input_path, vocab_size, special_tokens=None, num_workers=
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--input', default=str(DATA / 'owt_train.txt'))
-    ap.add_argument('--vocab-size', type=int, default=32000)
+    ap.add_argument('--input', default=str(DATA / 'TinyStories-train.txt'))
+    ap.add_argument('--vocab-size', type=int, default=10000)
     ap.add_argument('--workers', type=int, default=os.cpu_count())
     args = ap.parse_args()
 

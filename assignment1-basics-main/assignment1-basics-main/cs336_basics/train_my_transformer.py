@@ -9,7 +9,7 @@
        np.save('data/tinystories_ids.npy', np.array(ids, dtype=np.uint16))
 
     2) 训练：
-       python train_my_transformer.py --dataset data/tinystories_ids.npy --out-dir runs/ts
+       python ./cs336_basics/train_my_transformer.py --out-dir runs/ts 
 
     3) 断点续训：
        python train_my_transformer.py --dataset ... --out-dir runs/ts --resume-from runs/ts/checkpoint.pt
@@ -17,13 +17,14 @@
 import argparse
 import os
 import time
+import array
 from pathlib import Path
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from cs336_basics.my_pytorch import (
+from my_pytorch import (
     Transformer,
     AdamW,
     cross_entropy,
@@ -34,17 +35,18 @@ from cs336_basics.my_pytorch import (
     load_checkpoint,
 )
 
+from my_bpe import Tokenizer
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description='训练 CS336 Transformer LM')
     # 数据
-    ap.add_argument('--dataset', default='data/tinystories_ids.npy', help='token id 的 .npy 文件（uint16）')
-    ap.add_argument('--vocab-size', type=int, default=32000)
+    ap.add_argument('--dataset', default='data/TinyStories-train.npy', help='token id 的 .npy 文件（uint16）')
+    ap.add_argument('--vocab-size', type=int, default=10000)
     ap.add_argument('--context-length', type=int, default=512)
     ap.add_argument('--batch-size', type=int, default=32)
     # 模型结构
     ap.add_argument('--d-model', type=int, default=512)
-    ap.add_argument('--num-layers', type=int, default=6)
+    ap.add_argument('--num-layers', type=int, default=4)
     ap.add_argument('--num-heads', type=int, default=16)
     ap.add_argument('--d-ff', type=int, default=None, help='缺省按 8/3*d_model 取整到 64 的倍数')
     ap.add_argument('--theta', type=float, default=10000.0, help='RoPE 的 Θ')
@@ -58,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--weight-decay', type=float, default=0.01)
     ap.add_argument('--grad-clip', type=float, default=1.0, help='全局梯度范数上限')
     # 训练过程
-    ap.add_argument('--max-iters', type=int, default=5000, help='总训练迭代数，也是 cosine 周期 T_c')
+    ap.add_argument('--max-iters', type=int, default=20000, help='总训练迭代数，也是 cosine 周期 T_c')
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--log-interval', type=int, default=10)
@@ -68,8 +70,32 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def tokenize(args):
+    """把 --dataset 对应的语料转成 token id 数组：data/X.npy <- data/X.txt，
+    分词器取 data/X_bpe_<vocab_size>.pkl。已存在 .npy 时跳过。"""
+    dataset_path = Path(args.dataset)
+    corpus = dataset_path.with_suffix('.txt')
+    if dataset_path.exists():
+        return
+    assert corpus.exists(), f'corpus not found: {corpus}'
+    pkl = corpus.parent / f'{corpus.stem}_bpe_{args.vocab_size}.pkl'
+    tokenizer = Tokenizer.from_files(str(pkl), special_tokens=['<|endoftext|>'])
+    print(f'tokenizing {corpus} with {pkl.name} ...')
+    token_ids = array.array('H')  # uint16 紧凑存储，list[int] 装 4.5 亿 token 要 16GB 内存
+    with open(corpus, encoding='utf-8', errors='ignore') as f:  # 必须文本模式，正则只吃 str
+        for i, token_id in enumerate(tokenizer.encode_iterable(f)):
+            token_ids.append(token_id)
+            if i % 50_000_000 == 0 and i:
+                print(f'  {i:,} tokens so far')
+    np.save(dataset_path, np.frombuffer(token_ids, dtype=np.uint16))
+    print(f'saved {len(token_ids):,} tokens -> {dataset_path}')
+
+
 def main():
     args = build_parser().parse_args()
+
+    tokenize(args)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     out_dir = Path(args.out_dir)

@@ -29,6 +29,15 @@ build-backend = "uv_build"
 module-name = "cs336_basics"
 module-root = ""
 
+# PyTorch 换用 CUDA 12.8 构建（5090 Blackwell 需要 cu128；不带这个 sources 时 pypi 默认装 +cpu 轮子）
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
 [tool.uv]
 package = true
 python-preference = "managed"

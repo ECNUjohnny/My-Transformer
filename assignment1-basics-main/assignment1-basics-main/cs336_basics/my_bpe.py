@@ -173,6 +173,7 @@ class Tokenizer:
 
     def encode(self, text: str) -> list[int]:
         ids: list[int] = []
+        # 不要在这里加 tqdm：encode_iterable 逐行调用它，几百万行会刷爆控制台拖慢几十倍
         for piece, is_special in self._pretokenize(text):
             if is_special:
                 ids.append(self.antivocab[piece.encode('utf-8')])
