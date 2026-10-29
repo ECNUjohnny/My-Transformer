@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--log-interval', type=int, default=10)
     ap.add_argument('--ckpt-interval', type=int, default=500, help='每多少迭代存一次 checkpoint')
+    ap.add_argument('--milestone-interval', type=int, default=5000, help='每多少迭代额外留一份不可覆盖的里程碑快照')
     ap.add_argument('--out-dir', default='runs/run01', help='checkpoint 输出目录')
     ap.add_argument('--resume-from', default=None, help='从此 checkpoint 恢复训练')
     return ap
@@ -131,7 +132,12 @@ def main():
         print(f'resumed from {args.resume_from} at iteration {start_iter}')
 
     ckpt_path = out_dir / 'checkpoint.pt'
+    csv_path = out_dir / 'train_log.csv'
+    if start_iter == 0:
+        csv_path.write_text('iter,loss,lr,tok_per_sec\n')  # 覆盖旧日志；续训时追加
+
     t0 = time.perf_counter()
+    consecutive_bad = 0
     progress = tqdm(range(start_iter, args.max_iters), initial=start_iter, total=args.max_iters, ncols=110)
     for it in progress:
         # cosine 学习率调度：直接改 param_groups 里的 lr，优化器 step 时现读
@@ -143,6 +149,18 @@ def main():
         logits = model(x)
         loss = cross_entropy(logits.view(-1, args.vocab_size), y.view(-1))
 
+        # 崩塌保险：loss 不是有限值就跳过这一步；连续 3 次则回滚到最近 checkpoint
+        if not torch.isfinite(loss):
+            consecutive_bad += 1
+            print(f'\n[warn] iter {it}: non-finite loss ({loss.item()}), skipped')
+            if consecutive_bad >= 3 and ckpt_path.exists():
+                bad_iter = load_checkpoint(ckpt_path, model, optimizer)
+                consecutive_bad = 0
+                print(f'[warn] rolled back to checkpoint at iteration {bad_iter}')
+            optimizer.zero_grad()
+            continue
+        consecutive_bad = 0
+
         optimizer.zero_grad()
         loss.backward()
         gradient_clipping(model.parameters(), args.grad_clip)
@@ -151,9 +169,14 @@ def main():
         if it % args.log_interval == 0 or it == args.max_iters - 1:
             tok_per_sec = args.batch_size * args.context_length * (it - start_iter + 1) / (time.perf_counter() - t0 + 1e-9)
             progress.set_postfix(loss=f'{loss.item():.3f}', lr=f'{lr:.2e}', tok_s=f'{tok_per_sec:.0f}')
+            with open(csv_path, 'a') as f:  # 落盘日志，断连后也能事后画曲线
+                f.write(f'{it},{loss.item():.4f},{lr:.6e},{tok_per_sec:.0f}\n')
 
         if (it + 1) % args.ckpt_interval == 0 or it == args.max_iters - 1:
             save_checkpoint(model, optimizer, it + 1, ckpt_path)
+        # 里程碑：每 milestone-interval 步额外留一份不可覆盖的快照，崩塌后有好据点可回
+        if (it + 1) % args.milestone_interval == 0:
+            save_checkpoint(model, optimizer, it + 1, out_dir / f'checkpoint_{it + 1}.pt')
 
     print(f'done. final loss {loss.item():.4f}, checkpoint -> {ckpt_path}')
 
