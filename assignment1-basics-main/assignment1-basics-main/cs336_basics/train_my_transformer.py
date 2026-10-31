@@ -41,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description='训练 CS336 Transformer LM')
     # 数据
     ap.add_argument('--dataset', default='data/TinyStories-train.npy', help='token id 的 .npy 文件（uint16）')
+    ap.add_argument('--vocab', type=str, default='data/TinyStories-train_bpe_10000.pkl')
+    ap.add_argument('--ckpt', type=str, default='runs/ts/checkpoint.pt')
     ap.add_argument('--vocab-size', type=int, default=10000)
     ap.add_argument('--context-length', type=int, default=256)
     ap.add_argument('--batch-size', type=int, default=32)
@@ -68,6 +70,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--milestone-interval', type=int, default=5000, help='每多少迭代额外留一份不可覆盖的里程碑快照')
     ap.add_argument('--out-dir', default='runs/run01', help='checkpoint 输出目录')
     ap.add_argument('--resume-from', default=None, help='从此 checkpoint 恢复训练')
+
+    ap.add_argument('--max_tokens', type=int, default=200)
+    ap.add_argument('--temperature', type=float, default=0.8)
+    ap.add_argument('--top_p', type=float, default=1.0)
     return ap
 
 

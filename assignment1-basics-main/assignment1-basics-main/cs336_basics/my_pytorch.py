@@ -87,10 +87,13 @@ class RotaryPositionalEmbedding(nn.Module):
 
         return torch.stack((y1, y2), dim=-1).flatten(-2)
 
-def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+def softmax(x: torch.Tensor, dim: int, tao: float | None=None) -> torch.Tensor:
     # 先减最大值防溢出（.values 取 max 的结果张量）；不用 in-place，别改动调用方的张量
     x_max = torch.max(x, dim=dim, keepdim=True).values
-    e = torch.exp(x - x_max)
+    if tao is None:
+        e = torch.exp(x - x_max)
+    else:
+        e = torch.exp((x - x_max) / tao)
     return e / e.sum(dim=dim, keepdim=True)
     
 
@@ -170,7 +173,7 @@ class Transformer(nn.Module):
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
         self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)  # 输出到词表大小，不是 d_model
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
         x = self.token_embeddings(x)
         for layer in self.layers:
             x = layer(x)
@@ -257,10 +260,10 @@ def save_checkpoint(model: nn.Module, optimizer: torch.optim.Optimizer,
     }, out)
 
 
-def load_checkpoint(src, model: nn.Module, optimizer: torch.optim.Optimizer) -> int:
+def load_checkpoint(src, model: nn.Module, optimizer: torch.optim.Optimizer | None=None) -> int:
     ckpt = torch.load(src, map_location='cpu')
     model.load_state_dict(ckpt['model'])
-    optimizer.load_state_dict(ckpt['optimizer'])
+    if optimizer is not None: optimizer.load_state_dict(ckpt['optimizer'])
     return ckpt['iteration']
 
 
