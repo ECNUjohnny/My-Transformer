@@ -24,18 +24,31 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from my_pytorch import (
-    Transformer,
-    AdamW,
-    cross_entropy,
-    gradient_clipping,
-    learning_rate_schedule,
-    get_batch,
-    save_checkpoint,
-    load_checkpoint,
-)
+try:  # 包内绝对导入（被 benchmarking_script 等以包形式导入时）
+    from cs336_basics.my_pytorch import (
+        Transformer,
+        AdamW,
+        cross_entropy,
+        gradient_clipping,
+        learning_rate_schedule,
+        get_batch,
+        save_checkpoint,
+        load_checkpoint,
+    )
+    from cs336_basics.my_bpe import Tokenizer
+except ImportError:  # 直接以脚本方式运行时的兜底
+    from my_pytorch import (
+        Transformer,
+        AdamW,
+        cross_entropy,
+        gradient_clipping,
+        learning_rate_schedule,
+        get_batch,
+        save_checkpoint,
+        load_checkpoint,
+    )
 
-from my_bpe import Tokenizer
+    from my_bpe import Tokenizer
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description='训练 CS336 Transformer LM')
@@ -74,6 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--max_tokens', type=int, default=200)
     ap.add_argument('--temperature', type=float, default=0.8)
     ap.add_argument('--top_p', type=float, default=1.0)
+
+    ap.add_argument('--iter-to-count', type=int, default=100, help='测试多少个iter的时间')
+    ap.add_argument('--test_type', choices=[0, 1, 2], default=0, help='测试的时间的种类(前向, 前向+反向, 反向)')
     return ap
 
 
