@@ -33,8 +33,7 @@ def timeit_gpu(fn, number: int, warmup: int = 3) -> float:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     timer = timeit.Timer(fn)
-    return timer.timeit(number=number) / number
-
+    return timer.timeit(number) / number
 
 def main():
     args = build_parser().parse_args()
@@ -52,23 +51,37 @@ def main():
     number = min(args.max_iters, 30)  # 每个阶段重复 number 次；别让默认的 30000 把基准跑成训练
 
     def forward_only():
+        torch.cuda.nvtx.range_push('forward')
         with torch.no_grad():
             model(x)
+        torch.cuda.nvtx.range_pop()
 
     def forward_backward():
+        torch.cuda.nvtx.range_push('forward')
         optimizer.zero_grad()
         loss = cross_entropy(model(x).view(-1, args.vocab_size), y.view(-1))
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push('backward')
         loss.backward()
+        torch.cuda.nvtx.range_pop()
 
     def optimizer_step():
+        torch.cuda.nvtx.range_push('optimizer_step')
         optimizer.step()
+        torch.cuda.nvtx.range_pop()
 
     def full_iteration():
+        torch.cuda.nvtx.range_push('forward')
         loss = cross_entropy(model(x).view(-1, args.vocab_size), y.view(-1))
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push('backward')
         optimizer.zero_grad()
         loss.backward()
         gradient_clipping(model.parameters(), args.grad_clip)
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_push('optimizer_step')
         optimizer.step()
+        torch.cuda.nvtx.range_pop()
 
     # 预热 + 同步
     for _ in range(3):
