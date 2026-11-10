@@ -1,7 +1,7 @@
 """训练脚本：把 cs336_basics.my_pytorch 的组件拼成完整训练循环。
 
-用法（在 assignment 根目录）：
-    1) 先把语料转成 token id 数组（uint16 .npy），例如用训练好的分词器：
+用法(在 assignment 根目录)：
+    1) 先把语料转成 token id 数组(uint16 .npy),例如用训练好的分词器：
        tokenizer = Tokenizer.from_files('data/TinyStories-train_bpe_10000.pkl')
        ids = []
        with open('data/TinyStories-train.txt') as f:
@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-try:  # 包内绝对导入（被 benchmarking_script 等以包形式导入时）
+try:  # 包内绝对导入(被 benchmarking_script 等以包形式导入时)
     from cs336_basics.my_pytorch import (
         Transformer,
         AdamW,
@@ -53,7 +53,7 @@ except ImportError:  # 直接以脚本方式运行时的兜底
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description='训练 CS336 Transformer LM')
     # 数据
-    ap.add_argument('--dataset', default='data/TinyStories-train.npy', help='token id 的 .npy 文件（uint16）')
+    ap.add_argument('--dataset', default='data/TinyStories-train.npy', help='token id 的 .npy 文件(uint16)')
     ap.add_argument('--vocab', type=str, default='data/TinyStories-train_bpe_10000.pkl')
     ap.add_argument('--ckpt', type=str, default='runs/ts/checkpoint.pt')
     ap.add_argument('--vocab-size', type=int, default=10000)
@@ -66,8 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--d-ff', type=int, default=None, help='缺省按 8/3*d_model 取整到 64 的倍数')
     ap.add_argument('--theta', type=float, default=10000.0, help='RoPE 的 Θ')
     # 优化器
-    ap.add_argument('--lr', type=float, default=1e-3, help='alpha_max，cosine 调度的峰值学习率')
-    ap.add_argument('--min-lr', type=float, default=1e-4, help='alpha_min，cosine 末端学习率')
+    ap.add_argument('--lr', type=float, default=1e-3, help='alpha_max,cosine 调度的峰值学习率')
+    ap.add_argument('--min-lr', type=float, default=1e-4, help='alpha_min,cosine 末端学习率')
     ap.add_argument('--warmup-iters', type=int, default=100, help='线性预热的迭代数 T_w')
     ap.add_argument('--beta1', type=float, default=0.9)
     ap.add_argument('--beta2', type=float, default=0.95)
@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument('--weight-decay', type=float, default=0.01)
     ap.add_argument('--grad-clip', type=float, default=1.0, help='全局梯度范数上限')
     # 训练过程
-    ap.add_argument('--max-iters', type=int, default=30000, help='总训练迭代数，也是 cosine 周期 T_c')
+    ap.add_argument('--max-iters', type=int, default=30000, help='总训练迭代数,也是 cosine 周期 T_c')
     ap.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--log-interval', type=int, default=10)
@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def tokenize(args):
-    """把 --dataset 对应的语料转成 token id 数组：data/X.npy <- data/X.txt，
+    """把 --dataset 对应的语料转成 token id 数组：data/X.npy <- data/X.txt,
     分词器取 data/X_bpe_<vocab_size>.pkl。已存在 .npy 时跳过。"""
     dataset_path = Path(args.dataset)
     corpus = dataset_path.with_suffix('.txt')
@@ -104,8 +104,8 @@ def tokenize(args):
     pkl = corpus.parent / f'{corpus.stem}_bpe_{args.vocab_size}.pkl'
     tokenizer = Tokenizer.from_files(str(pkl), special_tokens=['<|endoftext|>'])
     print(f'tokenizing {corpus} with {pkl.name} ...')
-    token_ids = array.array('H')  # uint16 紧凑存储，list[int] 装 4.5 亿 token 要 16GB 内存
-    with open(corpus, encoding='utf-8', errors='ignore') as f:  # 必须文本模式，正则只吃 str
+    token_ids = array.array('H')  # uint16 紧凑存储,list[int] 装 4.5 亿 token 要 16GB 内存
+    with open(corpus, encoding='utf-8', errors='ignore') as f:  # 必须文本模式,正则只吃 str
         for i, token_id in enumerate(tokenizer.encode_iterable(f)):
             token_ids.append(token_id)
             if i % 50_000_000 == 0 and i:
@@ -162,7 +162,7 @@ def main():
     consecutive_bad = 0
     progress = tqdm(range(start_iter, args.max_iters), initial=start_iter, total=args.max_iters, ncols=110)
     for it in progress:
-        # cosine 学习率调度：直接改 param_groups 里的 lr，优化器 step 时现读
+        # cosine 学习率调度：直接改 param_groups 里的 lr,优化器 step 时现读
         lr = learning_rate_schedule(it, args.lr, args.min_lr, args.warmup_iters, args.max_iters)
         for group in optimizer.param_groups:
             group['lr'] = lr
@@ -191,12 +191,12 @@ def main():
         if it % args.log_interval == 0 or it == args.max_iters - 1:
             tok_per_sec = args.batch_size * args.context_length * (it - start_iter + 1) / (time.perf_counter() - t0 + 1e-9)
             progress.set_postfix(loss=f'{loss.item():.3f}', lr=f'{lr:.2e}', tok_s=f'{tok_per_sec:.0f}')
-            with open(csv_path, 'a') as f:  # 落盘日志，断连后也能事后画曲线
+            with open(csv_path, 'a') as f:  # 落盘日志,断连后也能事后画曲线
                 f.write(f'{it},{loss.item():.4f},{lr:.6e},{tok_per_sec:.0f}\n')
 
         if (it + 1) % args.ckpt_interval == 0 or it == args.max_iters - 1:
             save_checkpoint(model, optimizer, it + 1, ckpt_path)
-        # 里程碑：每 milestone-interval 步额外留一份不可覆盖的快照，崩塌后有好据点可回
+        # 里程碑：每 milestone-interval 步额外留一份不可覆盖的快照,崩塌后有好据点可回
         if (it + 1) % args.milestone_interval == 0:
             save_checkpoint(model, optimizer, it + 1, out_dir / f'checkpoint_{it + 1}.pt')
 

@@ -1,14 +1,14 @@
-"""大语料（TinyStories / OpenWebText）的多进程 BPE 训练脚本。
+"""大语料(TinyStories / OpenWebText)的多进程 BPE 训练脚本。
 
-BPE 训练是纯 CPU 任务，瓶颈在预分词计数——用 multiprocessing 按块并行。
-分块沿 <|endoftext|> 边界切（cs336_basics.pretokenization_example.find_chunk_boundaries），
-每个 worker 独立统计自己块内的 pretoken 计数，主进程合并 Counter 后跑 merge 循环。
+BPE 训练是纯 CPU 任务,瓶颈在预分词计数——用 multiprocessing 按块并行。
+分块沿 <|endoftext|> 边界切(cs336_basics.pretokenization_example.find_chunk_boundaries),
+每个 worker 独立统计自己块内的 pretoken 计数,主进程合并 Counter 后跑 merge 循环。
 
-用法（在 assignment 根目录）：
+用法(在 assignment 根目录)：
     python train_bpe_parallel.py --input data/owt_train.txt --vocab-size 32000
     python train_bpe_parallel.py --input data/TinyStories-train.txt --vocab-size 10000
 
-产出 data/<语料名>_bpe_<vocab_size>.pkl，含 vocab 与 merges。
+产出 data/<语料名>_bpe_<vocab_size>.pkl,含 vocab 与 merges。
 """
 import argparse
 import os
@@ -54,7 +54,7 @@ def train_bpe_parallel(input_path, vocab_size, special_tokens=None, num_workers=
     special_tokens = ['<|endoftext|>'] if special_tokens is None else special_tokens
     num_workers = num_workers or os.cpu_count()
 
-    # 块数取 worker 数的 8 倍做负载均衡（块边界只能落在 special token 上，大小不均）
+    # 块数取 worker 数的 8 倍做负载均衡(块边界只能落在 special token 上,大小不均)
     with open(input_path, 'rb') as f:
         split_token = special_tokens[0].encode('utf-8')
         boundaries = find_chunk_boundaries(f, num_workers * 8, split_token)

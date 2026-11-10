@@ -12,7 +12,7 @@ _PAT = re.compile(PAT)
 
 
 def init_vocab(special_lists: list[str]) -> dict[int, bytes]:
-    """special tokens 在前，之后是 256 个单字节 token"""
+    """special tokens 在前,之后是 256 个单字节 token"""
     vocab = {i: t.encode('utf-8') for i, t in enumerate(special_lists)}
     for b in range(256):
         vocab[len(vocab)] = bytes([b])
@@ -21,7 +21,7 @@ def init_vocab(special_lists: list[str]) -> dict[int, bytes]:
 
 def count_words(text: str, special_lists: list[str]) -> Counter:
     """按 special token 切分 -> GPT-2 正则预分词 -> Counter[str pretoken]
-    用 findall + Counter.update 让计数留在 C 层，最后只对 unique pretoken 做转码"""
+    用 findall + Counter.update 让计数留在 C 层,最后只对 unique pretoken 做转码"""
     freq = Counter()
     if special_lists:
         splitter = re.compile("|".join(re.escape(t) for t in special_lists))
@@ -34,7 +34,7 @@ def count_words(text: str, special_lists: list[str]) -> Counter:
 
 
 def to_byte_tuples(freq: Counter) -> tuple[list[tuple[bytes, ...]], list[int]]:
-    """Counter[str] -> (words, counts)，每个 unique pretoken 转成 tuple[bytes, ...]"""
+    """Counter[str] -> (words, counts),每个 unique pretoken 转成 tuple[bytes, ...]"""
     words, counts = [], []
     for s, c in freq.items():
         words.append(tuple(bytes([b]) for b in s.encode('utf-8')))
@@ -44,8 +44,8 @@ def to_byte_tuples(freq: Counter) -> tuple[list[tuple[bytes, ...]], list[int]]:
 
 def merge_loop(words: list[tuple[bytes, ...]], counts: list[int],
                vocab: dict[int, bytes], num_merges: int) -> list[tuple[bytes, bytes]]:
-    """增量维护 pair 频次与倒排索引(pair -> 含它的词下标)，每轮合并一个最高频 pair。
-    并列时取字典序更大的 pair（讲义规定）。vocab 会被就地扩展。"""
+    """增量维护 pair 频次与倒排索引(pair -> 含它的词下标),每轮合并一个最高频 pair。
+    并列时取字典序更大的 pair(讲义规定)。vocab 会被就地扩展。"""
     pair_counts = Counter()
     pair_to_words = defaultdict(set)
     for idx, word in enumerate(words):
@@ -58,7 +58,7 @@ def merge_loop(words: list[tuple[bytes, ...]], counts: list[int],
     for _ in tqdm(range(num_merges), ncols=100):
         if not pair_counts:
             break
-        # max 按元组比较：先比频次，频次并列时比 pair 字典序，正好是讲义的规定
+        # max 按元组比较：先比频次,频次并列时比 pair 字典序,正好是讲义的规定
         _, best = max(zip(pair_counts.values(), pair_counts.keys()))
         merges.append(best)
         new_token = best[0] + best[1]
@@ -91,7 +91,7 @@ def merge_loop(words: list[tuple[bytes, ...]], counts: list[int],
 
 def bpe(input_path: str, vocab_size: int,
         special_lists: list[str] = ['<|endoftext|>']) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """串行版，适合小语料（corpus.en / TinyStories sample）。大语料用 train_bpe_parallel.py"""
+    """串行版,适合小语料(corpus.en / TinyStories sample)。大语料用 train_bpe_parallel.py"""
     with open(input_path, 'rb') as f:
         text = f.read().decode(encoding='utf-8', errors='ignore')
 
@@ -117,7 +117,7 @@ class Tokenizer:
                 continue
             self.vocab[len(self.vocab)] = bseq
             self.antivocab[bseq] = len(self.vocab) - 1
-        # special token 切分正则：长的放前面，重叠时（如 <|endoftext|><|endoftext|>）优先整体匹配
+        # special token 切分正则：长的放前面,重叠时(如 <|endoftext|><|endoftext|>)优先整体匹配
         self._special_pat = None
         if self.special_tokens:
             alts = '|'.join(re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True))
@@ -126,15 +126,15 @@ class Tokenizer:
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str = None, special_tokens=None):
-        """加载 train_bpe_parallel.py 存的 pickle（单文件含 'vocab' 和 'merges' 两个键）"""
+        """加载 train_bpe_parallel.py 存的 pickle(单文件含 'vocab' 和 'merges' 两个键)"""
         with open(vocab_filepath, 'rb') as f:
             saved = pickle.load(f)
         return cls(saved['vocab'], saved['merges'], special_tokens)
 
     def _pretokenize(self, text: str) -> Iterator[tuple[str, bool]]:
         """切成 (piece, is_special)。
-        与训练预分词的关键区别：special token 必须保留为独立 piece（训练统计时才丢弃），
-        所以 split 要带捕获组，把切分符留在返回的列表里。"""
+        与训练预分词的关键区别：special token 必须保留为独立 piece(训练统计时才丢弃),
+        所以 split 要带捕获组,把切分符留在返回的列表里。"""
         if self._special_pat is None:
             yield from ((m.group(0), False) for m in _PAT.finditer(text))
             return
@@ -147,8 +147,8 @@ class Tokenizer:
                 yield from ((m.group(0), False) for m in _PAT.finditer(piece))
 
     def _encode_pretoken(self, pretoken: str) -> tuple[int, ...]:
-        """pretoken -> bytes 序列，反复套用当前 rank 最小（最早学到）的 merge 直到无法再合并。
-        pretoken 大量重复出现，用 cache 避免重复编码。"""
+        """pretoken -> bytes 序列,反复套用当前 rank 最小(最早学到)的 merge 直到无法再合并。
+        pretoken 大量重复出现,用 cache 避免重复编码。"""
         cached = self._cache.get(pretoken)
         if cached is not None:
             return cached
@@ -173,7 +173,7 @@ class Tokenizer:
 
     def encode(self, text: str) -> list[int]:
         ids: list[int] = []
-        # 不要在这里加 tqdm：encode_iterable 逐行调用它，几百万行会刷爆控制台拖慢几十倍
+        # 不要在这里加 tqdm：encode_iterable 逐行调用它,几百万行会刷爆控制台拖慢几十倍
         for piece, is_special in self._pretokenize(text):
             if is_special:
                 ids.append(self.antivocab[piece.encode('utf-8')])
@@ -182,12 +182,12 @@ class Tokenizer:
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        """逐块（如逐行）编码。训练大语料转 token ids 时用它，不用整读进内存"""
+        """逐块(如逐行)编码。训练大语料转 token ids 时用它,不用整读进内存"""
         for chunk in iterable:
             yield from self.encode(chunk)
 
     def decode(self, ids: list[int]) -> str:
-        # errors='replace'：无效 UTF-8 序列用替换符而非报错（讲义规定）
+        # errors='replace'：无效 UTF-8 序列用替换符而非报错(讲义规定)
         return b''.join(self.vocab[i] for i in ids).decode('utf-8', errors='replace')
 
 

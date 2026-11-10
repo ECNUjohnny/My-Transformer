@@ -6,7 +6,7 @@ from typing import BinaryIO, IO
 def get_batch(dataset: np.ndarray, batch_size: int, context_length: int,
               device: str) -> tuple[torch.Tensor, torch.Tensor]:
     n = len(dataset)
-    # 标签要读到 i + context_length，所以起点上限是 n - context_length - 1（randint 上界开区间）
+    # 标签要读到 i + context_length,所以起点上限是 n - context_length - 1(randint 上界开区间)
     starts = np.random.randint(0, n - context_length, size=batch_size)
     idx = starts[:, None] + np.arange(context_length)          # 广播出 (batch, context) 索引矩阵
     x = torch.from_numpy(dataset[idx].astype(np.int64)).to(device)
