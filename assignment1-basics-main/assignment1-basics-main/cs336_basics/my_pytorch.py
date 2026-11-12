@@ -4,6 +4,7 @@ from torch import nn
 from einops import rearrange, reduce, repeat, einsum
 import math
 import triton
+import triton.language as tl
 
 class Linear(nn.Module):
     def __init__(self, in_features, out_features, device=None, dtype=None):
@@ -278,12 +279,139 @@ def get_batch(dataset: np.ndarray, batch_size: int, context_length: int,
     return x, y
 
 @triton.jit
-def flashattention():
-    
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    IS_CAUSAL: tl.constexpr,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+):
+    # 启动网格 = (Tq, batch):每个程序实例只负责一个 batch、一个 query 分块。
+    # 注意:Triton 3.9 已移除块指针(make_block_ptr)API,这里用裸指针算术代替,
+    # 语义与 handout 的块指针版本完全一致。
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+    offs_q = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    offs_d = tl.arange(0, D)
+
+    q_i = tl.load(Q_ptr + batch_index * stride_qb
+                  + offs_q[:, None] * stride_qq + offs_d[None, :] * stride_qd)
+
+    # 片上缓冲区用 fp32 保证数值稳定(handout 准则)
+    o_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    m_i = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
+
+    # 只有这一个循环:迭代 key 分块 j = 1..Tk
+    for j in range(0, tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        offs_k = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        k_j = tl.load(K_ptr + batch_index * stride_kb
+                      + offs_k[:, None] * stride_kk + offs_d[None, :] * stride_kd)
+        v_j = tl.load(V_ptr + batch_index * stride_vb
+                      + offs_k[:, None] * stride_vk + offs_d[None, :] * stride_vd)
+
+        s_ij = tl.dot(q_i, tl.trans(k_j)) * scale
+
+        if IS_CAUSAL:
+            # 因果掩码:key 全局索引大于 query 全局索引处加 -1e6
+            s_ij = s_ij + tl.where(offs_q[:, None] >= offs_k[None, :], 0.0, -1e6)
+
+        m_ij = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        p_ij = tl.exp(s_ij - m_ij[:, None])
+        alpha = tl.exp(m_i - m_ij)
+        l_ij = alpha * l_i + tl.sum(p_ij, axis=1)
+        o_ij = alpha[:, None] * o_i + tl.dot(p_ij.to(v_j.dtype), v_j)
+        o_i, l_i, m_i = o_ij, l_ij, m_ij
+
+    o_i = o_i / l_i[:, None]
+    L_i = m_i + tl.log(l_i)
+
+    tl.store(O_ptr + batch_index * stride_ob
+             + offs_q[:, None] * stride_oq + offs_d[None, :] * stride_od,
+             o_i.to(O_ptr.dtype.element_ty))
+    tl.store(L_ptr + batch_index * stride_lb + offs_q * stride_lq,
+             L_i.to(L_ptr.dtype.element_ty))
+
+
+def _flash_backward_pytorch(Q, K, V, O, dO, L, scale, is_causal):
+    """按 handout 式 (13)-(19) 用重计算实现反向传播;不依赖 softmax。
+    L: 前向保存的 logsumexp, 形状 (batch, Nq)。所有计算在 fp32 中进行。"""
+    Q, K, V, O, dO, L = (t.to(torch.float32) for t in (Q, K, V, O, dO, L))
+    # D = rowsum(O ∘ dO),等于 rowsum(P ∘ dP)
+    D_vec = (O * dO).sum(dim=-1, keepdim=True)
+    # 重计算注意力分数与概率(式 13-14)
+    S = Q @ K.transpose(-1, -2) * scale
+    if is_causal:
+        Nq, Nk = Q.shape[-2], K.shape[-2]
+        mask = torch.arange(Nq, device=Q.device)[:, None] >= torch.arange(Nk, device=Q.device)[None, :]
+        S = S.masked_fill(~mask, -1e6)
+    P = torch.exp(S - L[..., None])
+    # 式 15-16
+    dV = P.transpose(-1, -2) @ dO
+    dP = dO @ V.transpose(-1, -2)
+    # 式 17-19
+    dS = P * (dP - D_vec)
+    dQ = dS @ K * scale
+    dK = dS.transpose(-1, -2) @ Q * scale
+    return dQ, dK, dV
+
+
+_compiled_flash_bwd = torch.compile(_flash_backward_pytorch)
 
 
 class FlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_casual) -> torch.Tensor: 
-        pass
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal=False) -> torch.Tensor:
+        assert q.is_cuda and k.is_cuda and v.is_cuda, "Expected CUDA tensors"
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous(), \
+            "Our pointer arithmetic will assume contiguous tensors"
+        batch, Nq, D = q.shape
+        Nk = k.shape[1]
+        assert D in (16, 32, 64, 128), "head dim must be a power of 2 >= 16"
+
+        scale = 1.0 / math.sqrt(D)
+        o = torch.empty_like(q)
+        l = torch.empty((batch, Nq), dtype=torch.float32, device=q.device)
+
+        Q_TILE_SIZE, K_TILE_SIZE = 16, 64
+        grid = (triton.cdiv(Nq, Q_TILE_SIZE), batch)
+        flash_fwd_kernel[grid](
+            q, k, v,
+            o, l,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            o.stride(0), o.stride(1), o.stride(2),
+            l.stride(0), l.stride(1),
+            Nq, Nk,
+            scale,
+            IS_CAUSAL=is_causal,
+            D=D,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE,
+        )
+        # 保存反向传播所需的激活检查点
+        ctx.save_for_backward(q, k, v, o, l)
+        ctx.scale = scale
+        ctx.is_causal = is_causal
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, l = ctx.saved_tensors
+        dq, dk, dv = _compiled_flash_bwd(q, k, v, o, do, l, ctx.scale, ctx.is_causal)
+        # 梯度 dtype 与输入对齐
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None
+
+
+flash_attention = FlashAttention.apply
 
