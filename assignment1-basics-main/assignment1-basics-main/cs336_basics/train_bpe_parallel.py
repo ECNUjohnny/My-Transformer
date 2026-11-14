@@ -4,7 +4,7 @@ BPE 训练是纯 CPU 任务,瓶颈在预分词计数——用 multiprocessing �
 分块沿 <|endoftext|> 边界切(cs336_basics.pretokenization_example.find_chunk_boundaries),
 每个 worker 独立统计自己块内的 pretoken 计数,主进程合并 Counter 后跑 merge 循环。
 
-用法(在 assignment 根目录)：
+用法(在 assignment 根目录):
     python train_bpe_parallel.py --input data/owt_train.txt --vocab-size 32000
     python train_bpe_parallel.py --input data/TinyStories-train.txt --vocab-size 10000
 
@@ -34,7 +34,7 @@ DATA = ROOT / 'data'
 
 
 def count_chunk(args):
-    """worker：读 [start, end) 字节块 -> 按 special token 切 -> 预分词 -> 返回 str pretoken 计数"""
+    """worker:读 [start, end) 字节块 -> 按 special token 切 -> 预分词 -> 返回 str pretoken 计数"""
     path, start, end, special_tokens = args
     with open(path, 'rb') as f:
         f.seek(start)

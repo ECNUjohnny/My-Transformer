@@ -1,10 +1,10 @@
-"""Assignment 2 benchmarking：测 Transformer 前向 / 反向 / 优化器步的单次耗时。
+"""Assignment 2 benchmarking:测 Transformer 前向 / 反向 / 优化器步的单次耗时。
 
-用法(在 assignment 根目录)：
+用法(在 assignment 根目录):
     .venv/Scripts/python.exe cs336_systems/benchmarking_script.py \
         --d-model 512 --num-layers 4 --num-heads 16 --batch-size 32 --context-length 256 --max-iters 20
 
-计时要点：
+计时要点:
   * CUDA 异步执行——每个计时区间前后必须 torch.cuda.synchronize(),否则 timeit 只测到 kernel 启动延迟(微秒级)
   * 先 warmup 几轮,排除 CUDA 上下文初始化、显存分配器扩容等一次性开销
   * timeit.Timer.timeit(number=N) 返回 N 次【总】秒数,要除以 N 才是单次

@@ -70,7 +70,7 @@ class FFN(nn.Module):
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device=None):
         super().__init__()
-        freq = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k)  # 负指数：低维转得快
+        freq = theta ** (-torch.arange(0, d_k, 2, device=device, dtype=torch.float32) / d_k)  # 负指数:低维转得快
         pos = torch.arange(0, max_seq_len, device=device, dtype=torch.float32)  # 含最后一个位置
         angles = torch.outer(pos, freq)
         self.register_buffer('cos_cached', angles.cos(), persistent=False)
@@ -103,7 +103,7 @@ def scaled_dot_product_attention(query: torch.Tensor, key: torch.Tensor, value: 
     # einsum 直接标明轴含义,等价于 query @ key.transpose(-2, -1)
     raw_atten = query @ key.transpose(-2, -1) / math.sqrt(d_k)
     if mask is not None:
-        # 讲义约定：True = 保留,False = 屏蔽。用 -1e9 而不是 -inf,避免整行全被屏蔽时出 NaN
+        # 讲义约定:True = 保留,False = 屏蔽。用 -1e9 而不是 -inf,避免整行全被屏蔽时出 NaN
         raw_atten = raw_atten.masked_fill(~mask, -1e9)
     return softmax(raw_atten, dim=-1) @ value
 
@@ -135,7 +135,7 @@ class MultiheadSelfAttention(nn.Module):
             q = self.rope(q, token_positions)
             k = self.rope(k, token_positions)
 
-        # 因果 mask：下三角 True(第 i 行只许看 j <= i),必须是 bool 类型才能取反
+        # 因果 mask:下三角 True(第 i 行只许看 j <= i),必须是 bool 类型才能取反
         mask = ~torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
         out = scaled_dot_product_attention(q, k, v, mask)
 
@@ -156,7 +156,7 @@ class TransformerBlock(nn.Module):
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None=None):
-        # pre-norm + 残差：y = x + attn(ln1(x)),再 y + ffn(ln2(y))(讲义公式 15)
+        # pre-norm + 残差:y = x + attn(ln1(x)),再 y + ffn(ln2(y))(讲义公式 15)
         x = x + self.attn(self.ln1(x), token_positions)
         return x + self.ffn(self.ln2(x))
 
@@ -183,7 +183,7 @@ class Transformer(nn.Module):
 
 
 def cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    # -log softmax(logits)_t = lse - logit_t：全程在 log 域,正确类概率再小也不会下溢出 inf
+    # -log softmax(logits)_t = lse - logit_t:全程在 log 域,正确类概率再小也不会下溢出 inf
     x_max = torch.max(logits, dim=-1, keepdim=True).values          # 防溢出的最大值
     lse = x_max + torch.log(torch.exp(logits - x_max).sum(dim=-1))  # 稳定的 log-sum-exp
     picked = torch.gather(logits, dim=-1, index=target.unsqueeze(-1)).squeeze(-1)  # 正确类的 logit

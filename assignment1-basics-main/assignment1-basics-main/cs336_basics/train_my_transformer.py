@@ -1,17 +1,17 @@
-"""训练脚本：把 cs336_basics.my_pytorch 的组件拼成完整训练循环。
+"""训练脚本:把 cs336_basics.my_pytorch 的组件拼成完整训练循环。
 
-用法(在 assignment 根目录)：
-    1) 先把语料转成 token id 数组(uint16 .npy),例如用训练好的分词器：
+用法(在 assignment 根目录):
+    1) 先把语料转成 token id 数组(uint16 .npy),例如用训练好的分词器:
        tokenizer = Tokenizer.from_files('data/TinyStories-train_bpe_10000.pkl')
        ids = []
        with open('data/TinyStories-train.txt') as f:
            ids.extend(tokenizer.encode_iterable(f))
        np.save('data/tinystories_ids.npy', np.array(ids, dtype=np.uint16))
 
-    2) 训练：
+    2) 训练:
        python ./cs336_basics/train_my_transformer.py --out-dir runs/ts 
 
-    3) 断点续训：
+    3) 断点续训:
        python train_my_transformer.py --dataset ... --out-dir runs/ts --resume-from runs/ts/checkpoint.pt
 """
 import argparse
@@ -94,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def tokenize(args):
-    """把 --dataset 对应的语料转成 token id 数组：data/X.npy <- data/X.txt,
+    """把 --dataset 对应的语料转成 token id 数组:data/X.npy <- data/X.txt,
     分词器取 data/X_bpe_<vocab_size>.pkl。已存在 .npy 时跳过。"""
     dataset_path = Path(args.dataset)
     corpus = dataset_path.with_suffix('.txt')
@@ -162,7 +162,7 @@ def main():
     consecutive_bad = 0
     progress = tqdm(range(start_iter, args.max_iters), initial=start_iter, total=args.max_iters, ncols=110)
     for it in progress:
-        # cosine 学习率调度：直接改 param_groups 里的 lr,优化器 step 时现读
+        # cosine 学习率调度:直接改 param_groups 里的 lr,优化器 step 时现读
         lr = learning_rate_schedule(it, args.lr, args.min_lr, args.warmup_iters, args.max_iters)
         for group in optimizer.param_groups:
             group['lr'] = lr
@@ -171,7 +171,7 @@ def main():
         logits = model(x)
         loss = cross_entropy(logits.view(-1, args.vocab_size), y.view(-1))
 
-        # 崩塌保险：loss 不是有限值就跳过这一步；连续 3 次则回滚到最近 checkpoint
+        # 崩塌保险:loss 不是有限值就跳过这一步；连续 3 次则回滚到最近 checkpoint
         if not torch.isfinite(loss):
             consecutive_bad += 1
             print(f'\n[warn] iter {it}: non-finite loss ({loss.item()}), skipped')
@@ -196,7 +196,7 @@ def main():
 
         if (it + 1) % args.ckpt_interval == 0 or it == args.max_iters - 1:
             save_checkpoint(model, optimizer, it + 1, ckpt_path)
-        # 里程碑：每 milestone-interval 步额外留一份不可覆盖的快照,崩塌后有好据点可回
+        # 里程碑:每 milestone-interval 步额外留一份不可覆盖的快照,崩塌后有好据点可回
         if (it + 1) % args.milestone_interval == 0:
             save_checkpoint(model, optimizer, it + 1, out_dir / f'checkpoint_{it + 1}.pt')
 

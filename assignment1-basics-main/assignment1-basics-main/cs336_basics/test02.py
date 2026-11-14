@@ -1,8 +1,13 @@
 import torch
+import numpy as np
+from torch import distributed as dist
 
-a = torch.tensor([[1, 2], [3, 4]])
-b = torch.tensor([[1, 2], [3, 4]])
+c = torch.arange(10)
 
-c = torch.stack((a, b), dim=-1)
+c = c[:, None]
+
+d = np.random.uniform(size=(2, 3, 3, ))
+
+
 
 print(c)

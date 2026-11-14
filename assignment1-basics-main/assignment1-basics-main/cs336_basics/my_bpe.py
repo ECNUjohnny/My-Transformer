@@ -58,7 +58,7 @@ def merge_loop(words: list[tuple[bytes, ...]], counts: list[int],
     for _ in tqdm(range(num_merges), ncols=100):
         if not pair_counts:
             break
-        # max 按元组比较：先比频次,频次并列时比 pair 字典序,正好是讲义的规定
+        # max 按元组比较:先比频次,频次并列时比 pair 字典序,正好是讲义的规定
         _, best = max(zip(pair_counts.values(), pair_counts.keys()))
         merges.append(best)
         new_token = best[0] + best[1]
@@ -72,7 +72,7 @@ def merge_loop(words: list[tuple[bytes, ...]], counts: list[int],
                     del pair_counts[pair]
                 pair_to_words[pair].discard(idx)
 
-            # 重叠序列必须从左到右贪心：(a,a,a) 合并 (a,a) 应得 (aa,a)
+            # 重叠序列必须从左到右贪心:(a,a,a) 合并 (a,a) 应得 (aa,a)
             merged, j = [], 0
             while j < len(word):
                 if j + 1 < len(word) and word[j] == best[0] and word[j + 1] == best[1]:
@@ -117,7 +117,7 @@ class Tokenizer:
                 continue
             self.vocab[len(self.vocab)] = bseq
             self.antivocab[bseq] = len(self.vocab) - 1
-        # special token 切分正则：长的放前面,重叠时(如 <|endoftext|><|endoftext|>)优先整体匹配
+        # special token 切分正则:长的放前面,重叠时(如 <|endoftext|><|endoftext|>)优先整体匹配
         self._special_pat = None
         if self.special_tokens:
             alts = '|'.join(re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True))
@@ -133,7 +133,7 @@ class Tokenizer:
 
     def _pretokenize(self, text: str) -> Iterator[tuple[str, bool]]:
         """切成 (piece, is_special)。
-        与训练预分词的关键区别：special token 必须保留为独立 piece(训练统计时才丢弃),
+        与训练预分词的关键区别:special token 必须保留为独立 piece(训练统计时才丢弃),
         所以 split 要带捕获组,把切分符留在返回的列表里。"""
         if self._special_pat is None:
             yield from ((m.group(0), False) for m in _PAT.finditer(text))
@@ -173,7 +173,7 @@ class Tokenizer:
 
     def encode(self, text: str) -> list[int]:
         ids: list[int] = []
-        # 不要在这里加 tqdm：encode_iterable 逐行调用它,几百万行会刷爆控制台拖慢几十倍
+        # 不要在这里加 tqdm:encode_iterable 逐行调用它,几百万行会刷爆控制台拖慢几十倍
         for piece, is_special in self._pretokenize(text):
             if is_special:
                 ids.append(self.antivocab[piece.encode('utf-8')])
@@ -187,7 +187,7 @@ class Tokenizer:
             yield from self.encode(chunk)
 
     def decode(self, ids: list[int]) -> str:
-        # errors='replace'：无效 UTF-8 序列用替换符而非报错(讲义规定)
+        # errors='replace':无效 UTF-8 序列用替换符而非报错(讲义规定)
         return b''.join(self.vocab[i] for i in ids).decode('utf-8', errors='replace')
 
 
